@@ -221,9 +221,6 @@ func balanceFactor(credits int64) float64 {
 	return math.Log1p(float64(credits) / 100.0)
 }
 
-// idleBase 未使用过的账号的闲置基准（小时），给一个中等偏大的值。
-const idleBaseHours = 1.0
-
 // idleFactor 闲置补偿：1 + min(idleHours*0.5, 2)。从未使用过给满分。
 func idleFactor(lastUsedNano int64, now time.Time) float64 {
 	if lastUsedNano == 0 {

@@ -690,46 +690,6 @@ func (h *Handler) writeAccountStatus(w http.ResponseWriter, uid string) {
 	writeOpenAIError(w, http.StatusNotFound, "not_found", "account not found")
 }
 
-// parsePositiveInt 解析正整数（1..5000）。
-func parsePositiveInt(s string) (int, error) {
-	var n int
-	if _, err := fmtSscan(s, &n); err != nil {
-		return 0, err
-	}
-	if n <= 0 {
-		return 0, errInvalidInt
-	}
-	if n > 5000 {
-		n = 5000
-	}
-	return n, nil
-}
-
-var errInvalidInt = tinyErr("invalid int")
-
-type tinyErr string
-
-func (e tinyErr) Error() string { return string(e) }
-
-// fmtSscan 仅用于整数解析，避免为一行引入 fmt 依赖歧义。
-func fmtSscan(s string, n *int) (int, error) {
-	v := 0
-	if len(s) == 0 {
-		return 0, errInvalidInt
-	}
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, errInvalidInt
-		}
-		v = v*10 + int(c-'0')
-		if v > 1000000 {
-			return 0, errInvalidInt
-		}
-	}
-	*n = v
-	return 1, nil
-}
-
 // adminExportAccounts GET /admin/api/accounts/export
 // 导出全量凭证（**含明文 token**），供备份/迁移。必须带 Bearer；不要把结果贴到公开渠道。
 // 导出默认**脱敏**：只有显式 ?raw=1 才返回可用凭证明文，且会写审计日志。
