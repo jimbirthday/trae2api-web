@@ -373,9 +373,20 @@ func (h *Handler) adminMetrics(w http.ResponseWriter, r *http.Request) {
 
 // adminGetConfig GET /admin/api/config：运行配置（脱敏，不回显 key）。
 func (h *Handler) adminGetConfig(w http.ResponseWriter, r *http.Request) {
+	lim := h.cfg.Pool.Limits()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"default_model":     h.cfg.DefaultModel,
-		"max_rotate":        h.cfg.MaxRotate,
+		"default_model": h.cfg.DefaultModel,
+		"max_rotate":    h.cfg.MaxRotate,
+		// 池级调优参数：面板要能展示「当前单账号在途上限」，否则用户只能翻配置
+		// 文件猜（env/config.json/热改三条来源不同，实际生效值只有这里准）。
+		"pool": map[string]any{
+			"max_in_flight":     h.cfg.Pool.MaxInFlight(),
+			"credit_floor":      lim.CreditFloor,
+			"breaker_threshold": lim.BreakerThresh,
+			"degrade_threshold": lim.DegradeThresh,
+			"soft_rate_max":     lim.SoftRateMax.String(),
+			"degrade_window":    lim.DegradeWindow.String(),
+		},
 		"plan_cooldown":     h.cfg.PlanCooldown.String(),
 		"soft_cooldown":     h.cfg.SoftCooldown.String(),
 		"err_threshold":     h.cfg.ErrThreshold,
@@ -461,11 +472,62 @@ func (h *Handler) adminSaveConfig(w http.ResponseWriter, r *http.Request) {
 			"新配置无法解析，已回滚："+perr.Error())
 		return
 	}
+	// 能热生效的字段就地应用，避免「改个在途上限还得重启整个网关」。
+	// 只处理 pool.max_in_flight：它是唯一被 atomic 副本缓存的运行时参数，
+	// 其余（冷却时长/阈值）在启动时被摊进 Handler 的普通字段里，没有热改入口。
+	hotApplied, hotSkipped := h.applyHotConfig(patch)
+	note := "已写入 config.json 并通过解析校验；需重启生效"
+	if len(hotApplied) > 0 {
+		note = "已写入 config.json；" + strings.Join(hotApplied, "、") + " 已即时生效，其余需重启"
+	}
+	if hotSkipped != "" {
+		note += "；" + hotSkipped
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"applied": applied,
-		"backup":  bak,
-		"note":    "已写入 config.json 并通过解析校验；需重启生效",
+		"applied":     applied,
+		"hot_applied": hotApplied,
+		"backup":      bak,
+		"note":        note,
 	})
+}
+
+// applyHotConfig 应用可热改的配置项，返回已生效的字段名列表。
+//
+// 目前只有 pool.max_in_flight：它在 Pool 里有 atomic 副本，改完下一个请求
+// 就按新上限选号。其它配置项（冷却时长、签名有效期、日志保留天数）分散在
+// Handler/scheduler 的普通字段里，热改需要额外的锁与重建，先不做。
+func (h *Handler) applyHotConfig(patch map[string]any) (applied []string, skipped string) {
+	raw, ok := patch["pool"]
+	if !ok {
+		return nil, ""
+	}
+	obj, ok := raw.(map[string]any)
+	if !ok {
+		return nil, ""
+	}
+	v, ok := obj["max_in_flight"]
+	if !ok {
+		return nil, ""
+	}
+	f, ok := v.(float64)
+	if !ok {
+		return nil, ""
+	}
+	// env 优先级高于 config.json：进程启动时 env 已经把值打进来了，这里再热改
+	// 会让「面板显示的值」和「重启后的值」不一致，所以直接拒绝并说明原因。
+	if strings.TrimSpace(os.Getenv("TW2A_MAX_IN_FLIGHT")) != "" {
+		log.Printf("[config] pool.max_in_flight 被 env TW2A_MAX_IN_FLIGHT 覆盖，跳过热更新")
+		return nil, "pool.max_in_flight 被环境变量 TW2A_MAX_IN_FLIGHT 覆盖，未热更新"
+	}
+	n := int(f)
+	lim := h.cfg.Pool.Limits()
+	if lim.MaxInFlight == n {
+		return nil, ""
+	}
+	lim.MaxInFlight = n
+	h.cfg.Pool.SetLimits(lim)
+	log.Printf("[config] pool.max_in_flight 热更新为 %d（下一请求生效）", n)
+	return []string{"pool.max_in_flight"}, ""
 }
 
 // verifyConfigFile 回读并解析一次配置文件，确认下次启动不会解析失败。
@@ -773,7 +835,7 @@ func (h *Handler) adminAccountTest(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"uid": uid, "model": model, "latency_ms": elapsed}
 	if terr != nil {
 		out["ok"] = false
-		out["error"] = terr.Error()
+		out["error"] = redactUpstream(sanitizeErrMsg(terr.Error()))
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
@@ -783,7 +845,7 @@ func (h *Handler) adminAccountTest(w http.ResponseWriter, r *http.Request) {
 		out["kind"] = upstream.Classify(status, string(respBody)).String()
 		// 默认不回显上游 body（可能含内部字段/密钥片段）；?debug=1 才给脱敏后的摘要。
 		if r.URL.Query().Get("debug") == "1" {
-			out["error"] = sanitizeErrMsg(string(respBody))
+			out["error"] = redactUpstream(sanitizeErrMsg(string(respBody)))
 		} else {
 			out["error"] = "上游返回 " + out["kind"].(string) + "（加 ?debug=1 查看摘要）"
 		}
@@ -794,7 +856,7 @@ func (h *Handler) adminAccountTest(w http.ResponseWriter, r *http.Request) {
 	rc.Close()
 	if aerr != nil {
 		out["ok"] = false
-		out["error"] = aerr.Error()
+		out["error"] = redactUpstream(sanitizeErrMsg(aerr.Error()))
 		writeJSON(w, http.StatusOK, out)
 		return
 	}

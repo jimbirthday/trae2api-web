@@ -246,7 +246,21 @@ TRAE 是无状态全量上下文，粘性不解决上下文拼接，但能避免
 ### 在途租约
 
 每个账号默认最多 2 个并发在途请求（`pool.max_in_flight`），超出时选号直接跳过，
-防止单个号被并发打爆。`0` 表示不限制。
+防止单个号被并发打爆。`0` 表示不限制，上限 64。
+
+**改这个值有四条路**（优先级：env > config.json > 代码默认）：
+
+| 方式 | 写法 | 生效时机 |
+|---|---|---|
+| 环境变量（最高优先级） | `TW2A_MAX_IN_FLIGHT=4`（`.env` 里就是这一行） | 重启容器 |
+| 配置文件 | `"pool": { "max_in_flight": 4 }` | 重启容器 |
+| 面板/接口 | `POST /admin/api/config` body `{"pool":{"max_in_flight":4}}` | **即时生效**（不重启） |
+| 代码默认 | `cmd/server/main.go` 里 `p.SetLimits(...)` | 重新编译 |
+
+热更新的实现：`Pool` 里有 `maxInFlight atomic.Int32` 副本，`SetLimits` 会刷新它，
+下一个请求选号就按新上限；在途计数本身不清零，所以调小上限后已超额的号会先自然回落。
+若 `TW2A_MAX_IN_FLIGHT` 设置了 env，面板热改会被跳过（env 优先，否则「面板显示 4、重启回到 2」）。
+当前生效值可在 `GET /admin/api/config` 的 `pool.max_in_flight` 里看到。
 
 ### 请求流水
 

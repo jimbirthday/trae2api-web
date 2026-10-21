@@ -404,7 +404,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 只能就地收尾报错（error 帧 + [DONE]）。
 			rec.Outcome = reqlog.OutcomeStreamError
 			rec.Error = sanitizeErrMsg(runErr.Error())
-			sse.WriteError(publicStreamErrMsg(runErr))
+			sse.WriteError(redactUpstream(publicStreamErrMsg(runErr)))
 			return
 		}
 
@@ -494,7 +494,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 收尾，客户端才会立刻报错而不是一直挂着等 token。
 	if sse != nil {
 		rec.Outcome = reqlog.OutcomeStreamError
-		sse.WriteError(msg)
+		sse.WriteError(redactUpstream(msg))
 		return
 	}
 	writeChatError(w, rec, http.StatusServiceUnavailable, "no_healthy_account", msg)
@@ -552,7 +552,9 @@ func openAIErrType(status int) string {
 
 // writeChatError 写 OpenAI 风格错误响应，并带上请求 ID 便于与流水对齐。
 func writeChatError(w http.ResponseWriter, rec *reqlog.Event, status int, code, msg string) {
-	msg = sanitizeErrMsg(msg)
+	// 出站前统一脱敏：任何调用点把上游 err.Error() 直接传进来都不会泄漏
+	// 上游 URL/内网域名（详见 redact.go 的说明）。
+	msg = redactUpstream(sanitizeErrMsg(msg))
 	if rec != nil && rec.RequestID != "" {
 		w.Header().Set("X-Request-ID", rec.RequestID)
 	}
@@ -576,6 +578,10 @@ func publicStreamErrMsg(err error) string {
 	switch {
 	case errors.Is(err, upstream.ErrStreamIdleTimeout):
 		return "upstream stalled (no data within idle timeout); please retry"
+	case upstream.IsUpstreamTimeout(err):
+		// 响应头超时（Transport.ResponseHeaderTimeout）是 *url.Error，Error() 里带
+		// 完整上游 URL；这类必须走固定文案，不能落进默认分支之外的任何透传路径。
+		return "upstream timed out before responding; please retry"
 	case errors.Is(err, upstream.ErrTruncatedStream):
 		return "upstream closed the stream before completion; please retry"
 	case errors.Is(err, upstream.ErrEmptyCompletion):

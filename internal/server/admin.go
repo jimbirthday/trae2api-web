@@ -173,7 +173,7 @@ func (h *Handler) fetchCredits() []creditRow {
 			}
 			remain, limit, used, packs, err := h.cfg.Upstream.EntUsage(a)
 			if err != nil {
-				ac.Error = "ent_usage: " + err.Error()
+				ac.Error = "ent_usage: " + redactUpstream(sanitizeErrMsg(err.Error()))
 			} else {
 				ac.Remain, ac.Limit, ac.Used, ac.Packs = remain, limit, used, packs
 				// 回写 pool 的**余额**：不回写会让面板显示 4743 而选号权重仍按旧值计算。
@@ -190,7 +190,7 @@ func (h *Handler) fetchCredits() []creditRow {
 				if ac.Error != "" {
 					ac.Error += "; "
 				}
-				ac.Error += "checkin: " + cerr.Error()
+				ac.Error += "checkin: " + redactUpstream(sanitizeErrMsg(cerr.Error()))
 			} else {
 				// 本地按天记录的签到状态一并纳入：上游偶尔不回 checked_in，
 				// 本地日期戳能保证「今天签过」的号不会一直显示未签到。

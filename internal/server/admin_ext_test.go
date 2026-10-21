@@ -183,3 +183,34 @@ func mustJSON(t *testing.T, s string) string {
 	}
 	return string(b)
 }
+
+// 面板保存 pool.max_in_flight 后必须立刻生效（不用重启）。
+func TestSaveConfigHotAppliesMaxInFlight(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"pool":{"max_in_flight":2}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, soloSSE, true
+	}), ConfigPath: cfgPath})
+
+	req := httptest.NewRequest("POST", "/admin/api/config",
+		strings.NewReader(`{"pool":{"max_in_flight":5}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	if got := p.MaxInFlight(); got != 5 {
+		t.Fatalf("max_in_flight=%d want 5（应即时生效）", got)
+	}
+	var out struct {
+		Hot []string `json:"hot_applied"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if len(out.Hot) != 1 || out.Hot[0] != "pool.max_in_flight" {
+		t.Fatalf("hot_applied=%v", out.Hot)
+	}
+}

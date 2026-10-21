@@ -341,3 +341,14 @@ func nowFunc() time.Time { return time.Now() }
 
 // MaxInFlight 返回单账号在途上限（<=0 = 不限）。
 func (p *Pool) MaxInFlight() int { return int(p.maxInFlight.Load()) }
+
+// Limits 返回当前调优参数快照。
+//
+// 面板热改只改其中一两个字段，需要一个「读出来 → 改一个 → 写回去」的入口；
+// 让调用方自己拼一个完整的 Limits 会把未改的字段清零（normalize 再回落默认），
+// 等于顺手重置了熔断阈值/降权窗口，所以必须提供整体快照。
+func (p *Pool) Limits() Limits {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.limits
+}

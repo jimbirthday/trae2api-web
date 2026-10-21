@@ -657,6 +657,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 // type 依据 code 前缀映射（OpenAI 的 error.type 是稳定枚举，客户端按它分支），
 // code 原样回显本服务的细分码，便于排查。
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
+	// 与 writeChatError 同一条底线：出站前抹掉上游地址。管理端有几个接口会把
+	// 上游 err.Error()（*url.Error，含完整 URL）直接放进 message，这里兜住。
+	msg = redactUpstream(sanitizeErrMsg(msg))
 	// code 映射不出来时，再用 HTTP 状态兜底（chat 路径的 openAIErrType 口径一致）。
 	t := openAIErrorType(code)
 	if t == "api_error" {

@@ -39,7 +39,9 @@ func authorizeRender(w http.ResponseWriter, status int, title, detail string) {
 	// title/detail 可能含昵称、上游错误文本、query 参数 —— 一律转义后再拼进 HTML，
 	// 否则回调页会成为反射型/存储型 XSS 的落点。
 	title = html.EscapeString(title)
-	detail = html.EscapeString(detail)
+	// 上游错误文本可能带内网/上游地址，先脱敏再转义（顺序不能反：先转义会把
+	// URL 里的 & 变成 &amp;，正则仍能匹配，但反过来的可读性更差）。
+	detail = html.EscapeString(redactUpstream(detail))
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	// 回调 URL 的 query 里带着 refreshToken/userInfo：绝不能通过 Referer 泄漏给第三方。
