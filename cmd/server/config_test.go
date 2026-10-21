@@ -8,7 +8,7 @@ import (
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.Listen != ":7864" {
+	if c.Listen != ":8000" {
 		t.Errorf("listen=%s", c.Listen)
 	}
 	if c.DefaultModel != "glm-5.2" {
@@ -47,7 +47,7 @@ func TestLoadMissingFileFallsBackToDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != ":7864" {
+	if c.Listen != ":8000" {
 		t.Errorf("listen=%s", c.Listen)
 	}
 }

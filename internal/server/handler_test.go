@@ -1,4 +1,4 @@
-﻿package server
+package server
 
 import (
 	"encoding/json"
@@ -51,7 +51,7 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	p := pool.New("")
 	for _, a := range auths {
 		p.Add(a)
-		p.SetCredits(a.UID, 1000)
+		p.SetCredits(a.UID, 1000, 1000)
 	}
 	return p
 }
@@ -125,8 +125,8 @@ func TestChatRotatesOnPlanLimit(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 2000)
+	p.SetCredits("good", 1000, 1000)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
@@ -134,8 +134,24 @@ func TestChatRotatesOnPlanLimit(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 	}
-	if calls["Cloud-IDE-JWT at-bad"] != 1 || calls["Cloud-IDE-JWT at-good"] != 1 {
-		t.Errorf("calls=%v", calls)
+	// 选号是加权随机，无法预知首次命中哪个号；循环到 plan-limit 账号被命中为止。
+	for i := 0; i < 100 && calls["Cloud-IDE-JWT at-bad"] == 0; i++ {
+		req = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+		}
+	}
+	if calls["Cloud-IDE-JWT at-bad"] != 1 {
+		t.Errorf("plan-limit account should be tried exactly once, calls=%v", calls)
+	}
+	if calls["Cloud-IDE-JWT at-good"] < 1 {
+		t.Errorf("should fail over to healthy account, calls=%v", calls)
+	}
+	st, _ := p.Status("bad")
+	if !st.Cooling {
+		t.Errorf("plan-limit account should be cooling: %+v", st)
 	}
 }
 
@@ -156,7 +172,7 @@ func TestChatStreamCooldownOnStreamError(t *testing.T) {
 		t.Errorf("body=%q want error event + [DONE]", body)
 	}
 	st, _ := p.Status("u1")
-	if st.ErrCount == 0 {
+	if st.ErrCount == 0 && st.ErrTotal == 0 {
 		t.Errorf("stream error should bump errCount: %+v", st)
 	}
 }
@@ -316,7 +332,7 @@ func TestAPIKeyAuthCaseInsensitivePrefix(t *testing.T) {
 
 func TestStatusEndpoint(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
-	p.SetCredits("u1", 42)
+	p.SetCredits("u1", 42, 42)
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/status", nil)
 	rec := httptest.NewRecorder()

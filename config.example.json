@@ -1,5 +1,6 @@
 {
-  "listen": ":7864",
+  "listen": ":8000",
+  "callback_port": "18080",
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "default_model": "glm-5.2",
@@ -9,11 +10,51 @@
     "err_threshold": 3,
     "err_cooldown": "10m"
   },
+  "pool": {
+    "max_in_flight": 2,
+    "soft_rate_max": "30m",
+    "breaker_threshold": 3,
+    "breaker_cooldown": "10m",
+    "breaker_cooldown_max": "1h",
+    "degrade_threshold": 5,
+    "degrade_window": "10m",
+    "credit_floor": 0
+  },
+  "usage": {
+    "enabled": true,
+    "file": "./data/usage.json",
+    "credit_sampling": "30s"
+  },
+  "session": {
+    "enabled": true,
+    "ttl": "30m",
+    "gc_interval": "5m"
+  },
+  "reqlog": {
+    "enabled": true,
+    "dir": "./data/logs",
+    "file_max_mb": 16,
+    "retain_days": 7
+  },
   "schedule": {
     "checkin_hour": 9,
-    "refresh_hours": [3]
+    "refresh_hours": [
+      3
+    ],
+    "balance_hours": [
+      8,
+      12,
+      18,
+      23
+    ]
   },
   "upstream": {
-    "timeout_seconds": 120
+    "timeout_seconds": 120,
+    "model_error_rules": [
+      {
+        "code": 3003,
+        "kind": "model_unavailable"
+      }
+    ]
   }
 }

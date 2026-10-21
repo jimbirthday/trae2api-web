@@ -6,6 +6,10 @@ config.json
 *.key
 *.pem
 
+# 运行期产物(日志/状态/用量)与本地编译二进制
+logs/
+trae2api-web
+
 # 二进制
 login
 signin
@@ -19,6 +23,7 @@ tw2api
 !README.md
 docs/*
 !docs/RESEARCH.md
+!docs/SCHEDULING.md
 !docs/logo.svg
 
 # 构建产物

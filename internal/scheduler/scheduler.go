@@ -1,5 +1,5 @@
-﻿// Package scheduler 定时任务：每日签到 + token 预刷新。
-// 签到成功后重新查积分，积分 > 0 的冷却账号自动解冻。
+// Package scheduler 定时任务：每日签到 + 余额回写 + token 预刷新。
+// 签到/余额查询成功后回写 pool（含 credits 与容量），积分 > 0 的冷却账号自动解冻。
 package scheduler
 
 import (
@@ -8,6 +8,7 @@ import (
 	"log"
 	"time"
 
+	"trae2api-web/internal/logfmt"
 	"trae2api-web/internal/pool"
 	"trae2api-web/internal/upstream"
 )
@@ -18,6 +19,7 @@ type Config struct {
 	Upstream     *upstream.Client
 	CheckinHour  int           // 每日签到小时，默认 9
 	RefreshHours []int         // token 预刷新小时，默认 [3]
+	BalanceHours []int         // 余额回写小时，默认 [8,12,18,23]
 	RefreshSkew  time.Duration // 预刷新窗口，默认 24h
 }
 
@@ -33,6 +35,9 @@ func New(cfg Config) *Scheduler {
 	}
 	if len(cfg.RefreshHours) == 0 {
 		cfg.RefreshHours = []int{3}
+	}
+	if len(cfg.BalanceHours) == 0 {
+		cfg.BalanceHours = []int{8, 12, 18, 23}
 	}
 	if cfg.RefreshSkew <= 0 {
 		cfg.RefreshSkew = 24 * time.Hour
@@ -57,7 +62,9 @@ func nextFire(now time.Time, hours []int) time.Time {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
-	all := append(append([]int{}, s.cfg.RefreshHours...), s.cfg.CheckinHour)
+	all := append([]int{}, s.cfg.RefreshHours...)
+	all = append(all, s.cfg.BalanceHours...)
+	all = append(all, s.cfg.CheckinHour)
 	for {
 		next := nextFire(time.Now(), all)
 		timer := time.NewTimer(time.Until(next))
@@ -72,6 +79,9 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 			if s.cfg.CheckinHour == h {
 				s.RunCheckinNow()
+			}
+			if contains(s.cfg.BalanceHours, h) {
+				s.RunBalanceNow()
 			}
 		}
 	}
@@ -94,29 +104,59 @@ func (s *Scheduler) RunCheckinNow() {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil || a.RefreshTokenValue() == "" {
+		if a == nil {
 			continue
 		}
 		// 签到（status → 未签到则 claim）
 		checkedIn, _, enable, err := s.cfg.Upstream.CheckinStatus(a)
 		if err != nil {
-			log.Printf("checkin status %s: %v", st.UID, err)
+			log.Printf("checkin status %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 		} else if !checkedIn && enable {
 			if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
-				log.Printf("checkin claim %s: %v", st.UID, err)
+				log.Printf("checkin claim %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			} else {
-				log.Printf("checkin %s: ok", st.UID)
+				log.Printf("checkin %s: ok", logfmt.Label(st.UID, st.Nickname))
+				s.cfg.Pool.NoteCheckinDone(st.UID)
 			}
 		} else if checkedIn {
-			log.Printf("checkin %s: already checked in", st.UID)
+			log.Printf("checkin %s: already checked in", logfmt.Label(st.UID, st.Nickname))
+			s.cfg.Pool.NoteCheckinDone(st.UID)
 		}
-		// 查积分 + 解冻
-		remain, err := s.cfg.Upstream.UserEntUsage(a)
+		// 查积分 + 回写 + 解冻（原实现 ReenableIfCredits 已隐含回写）
+		remain, limit, used, _, err := s.cfg.Upstream.EntUsage(a)
 		if err != nil {
-			log.Printf("ent-usage %s: %v", st.UID, err)
+			log.Printf("ent-usage %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
 		}
+		total := limit
+		if total <= 0 {
+			total = remain + used
+		}
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, 0, time.Time{}, 0)
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+	}
+}
+
+// RunBalanceNow 只刷新余额（不签到），把最新积分回写 pool 供加权选号使用。
+func (s *Scheduler) RunBalanceNow() {
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		remain, limit, used, _, err := s.cfg.Upstream.EntUsage(a)
+		if err != nil {
+			log.Printf("balance %s: %v", logfmt.Label(st.UID, st.Nickname), err)
+			continue
+		}
+		total := limit
+		if total <= 0 {
+			total = remain + used
+		}
+		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, 0, time.Time{}, 0)
 	}
 }
 
@@ -134,7 +174,7 @@ func (s *Scheduler) RunRefreshNow() {
 			continue
 		}
 		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
-			log.Printf("refresh %s: %v", st.UID, err)
+			log.Printf("refresh %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				s.cfg.Pool.Disable(st.UID, "session dead")
@@ -142,7 +182,7 @@ func (s *Scheduler) RunRefreshNow() {
 			continue
 		}
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("refresh %s save: %v", st.UID, err)
+			log.Printf("refresh %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
 }

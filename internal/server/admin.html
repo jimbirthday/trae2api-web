@@ -99,16 +99,19 @@
   </header>
 
   <div class="keybar">
-    <span>API Key（写操作需）：</span>
-    <input id="apikey" type="password" placeholder="TW2A_API_KEY（写操作必填，点「记忆」保存）" oninput="onKeyChange()">
-    <button class="btn sm" onclick="saveKey()">保存</button>
-    <span id="keystatus" class="saved" style="display:none">已记忆</span>
-    <span style="margin-left:auto;font-size:11px">列表/额度为只读；导入/删除/开关/登录需 Key</span>
+    <span>API Key：</span>
+    <input id="apikey" type="password" placeholder="TW2A_API_KEY（会话失效后需重新填写）" oninput="onKeyChange()">
+    <button class="btn sm" onclick="saveKey()">应用</button>
+    <span id="keystatus" class="saved" style="display:none">已应用</span>
+    <button class="btn sm" onclick="logout()">退出登录</button>
+    <span style="margin-left:auto;font-size:11px">面板与全部接口均需鉴权</span>
   </div>
 
   <div class="tabs">
     <div class="tab active" onclick="switchTab('accounts',this)">账号管理</div>
     <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
+    <div class="tab" onclick="switchTab('requests',this)">请求流水</div>
+    <div class="tab" onclick="switchTab('usage',this)">用量统计</div>
   </div>
 
   <!-- 账号管理 -->
@@ -120,15 +123,65 @@
     </div>
 
     <div class="login-bar">
-      <h2>导入凭证（粘贴回调链接或 JSON）</h2>
-      <textarea class="imp" id="impInput" placeholder="粘贴 http://127.0.0.1:18080/authorize?refreshToken=... 回调链接，或 {&quot;account&quot;:...,&quot;auth&quot;:...} / {&quot;accessToken&quot;:...,&quot;uid&quot;:...} JSON"></textarea>
+      <h2>导入凭证（文件 / 粘贴回调链接或 JSON）</h2>
+      <div class="imp-row" style="margin-top:0;margin-bottom:8px">
+        <input type="file" id="impFile" accept=".json,application/json" multiple onchange="importFiles(this)" style="font-size:12px">
+        <span style="font-size:11px;color:var(--dim)">支持 .json 文件：{"accounts":[{...}]}、[{...}]、单条 {name,token,refreshToken,cookies} 或 trae-cn-relay-accounts 导出包</span>
+      </div>
+      <textarea class="imp" id="impInput" placeholder="粘贴 http://127.0.0.1:8000/authorize?refreshToken=... 回调链接，或 {&quot;accounts&quot;:[{&quot;name&quot;:&quot;账号1&quot;,&quot;token&quot;:&quot;&lt;jwt&gt;&quot;,&quot;refreshToken&quot;:&quot;...&quot;}]} / {&quot;format&quot;:&quot;trae-cn-relay-accounts&quot;,&quot;accounts&quot;:[...]} / {&quot;account&quot;:...,&quot;auth&quot;:...} JSON"></textarea>
       <div class="imp-row">
-        <button class="btn" onclick="importCred()">导入</button>
+        <button class="btn primary" onclick="importCred()">导入</button>
+        <button class="btn" onclick="exportCreds()">导出全部凭证</button>
         <span id="impStatus" class="login-status" style="display:none"></span>
       </div>
     </div>
 
+    <div class="login-bar">
+      <h2>批量运维</h2>
+      <div class="imp-row">
+        <button class="btn" onclick="bulk('enable')">全部启用</button>
+        <button class="btn" onclick="bulk('disable')">全部停用</button>
+        <button class="btn" onclick="bulk('pause')">全部暂停选号</button>
+        <button class="btn" onclick="bulk('resume')">全部恢复选号</button>
+        <button class="btn primary" onclick="checkinAll()">全部签到 + 刷额度</button>
+        <span id="bulkStatus" class="login-status" style="display:none"></span>
+      </div>
+    </div>
+
     <div id="acctTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
+  </div>
+
+  <!-- 请求流水 -->
+  <div id="pane-requests" class="pane">
+    <div class="login-bar">
+      <h2>请求流水与指标</h2>
+      <div class="imp-row">
+        <input class="imp" style="min-height:auto;width:180px" id="fUid" placeholder="uid 过滤">
+        <input class="imp" style="min-height:auto;width:180px" id="fModel" placeholder="model 过滤">
+        <input class="imp" style="min-height:auto;width:140px" id="fOutcome" placeholder="outcome">
+        <button class="btn" onclick="loadRequests()">查询</button>
+      </div>
+      <div id="metricsLine" class="login-status" style="display:none"></div>
+    </div>
+    <div id="reqTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
+  </div>
+
+  <!-- 用量统计 -->
+  <div id="pane-usage" class="pane">
+    <div class="login-bar">
+      <h2>按模型用量统计</h2>
+      <div class="imp-row">
+        <button class="btn" onclick="loadUsage()">刷新</button>
+        <span id="usageMeta" class="login-status" style="display:none"></span>
+      </div>
+      <div style="color:var(--dim);font-size:11px;margin-top:8px;line-height:1.7">
+        Token 与缓存率为<b>全量精确</b>（取自每个请求的 <code>token_usage</code> 事件）；
+        「积分/百万」为<b>窗口采样估算</b>——上游只提供账号级累计计数器且异步结算，
+        因此按「一个窗口内的积分增量 ÷ 同窗口 token 总量」计算，再按 token 比例分摊到模型，
+        取多次样本的中位数抗离群。样本数见末列，样本为 0（刚启动或窗口未满）时显示 "-"。
+      </div>
+    </div>
+    <div id="usageTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
   </div>
 
   <!-- 额度监控 -->
@@ -165,10 +218,27 @@ function apiErr(d, fallback){
 }
 function getKey(){ return document.getElementById('apikey').value.trim(); }
 function onKeyChange(){ document.getElementById('keystatus').style.display='none'; }
-function saveKey(){
-  localStorage.setItem('tw2a_admin_key', getKey());
+async function saveKey(){
+  const k = getKey();
+  if(!k){ alert('请填写 API Key'); return; }
+  // 换 cookie（会话），成功后刷新页面
+  const r = await fetch('/admin/api/session', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({key:k})
+  });
+  if(!r.ok){
+    const d = await r.json().catch(()=>({}));
+    alert('Key 不正确：'+apiErr(d));
+    return;
+  }
+  localStorage.setItem('tw2a_admin_key', k);
   const s = document.getElementById('keystatus');
-  s.style.display=''; setTimeout(()=>s.style.display='none', 1500);
+  s.style.display=''; s.textContent='已应用';
+  setTimeout(()=>location.reload(), 300);
+}
+async function logout(){
+  await fetch('/admin/api/session', {method:'DELETE'});
+  localStorage.removeItem('tw2a_admin_key');
+  location.reload();
 }
 (function loadKey(){
   const k = localStorage.getItem('tw2a_admin_key') || '';
@@ -183,7 +253,12 @@ function switchTab(name, el){
   document.getElementById('pane-'+name).classList.add('active');
   refreshActive();
 }
-function refreshActive(){ if(activeTab==='accounts') loadAccounts(); else loadCredits(); }
+function refreshActive(){
+  if(activeTab==='accounts') loadAccounts();
+  else if(activeTab==='credits') loadCredits();
+  else if(activeTab==='usage') loadUsage();
+  else loadRequests();
+}
 
 /* ─── 账号管理 ─── */
 async function loadAccounts(){
@@ -206,8 +281,10 @@ function renderAccounts(accts){
     let badges = '';
     if(a.disabled) badges += badge('禁用(session dead)','b-bad');
     else if(!a.enabled) badges += badge('已停用','b-warn');
-    else if(a.cooling) badges += badge('冷却','b-warn');
+    else if(a.paused) badges += badge('已暂停选号','b-dim');
+    else if(a.cooling) badges += badge('冷却'+(a.cool_kind?':'+a.cool_kind:''),'b-warn');
     else badges += badge('正常','b-ok');
+    if(a.model_blocked && a.model_blocked.length) badges += badge(a.model_blocked.length+' 模型限额','b-dim');
     if(a.expired_soon) badges += badge('token将过期','b-warn');
     const exp = a.expires_at ? new Date(a.expires_at*1000).toLocaleString() : '-';
     const toggleChecked = a.enabled && !a.disabled ? 'checked' : '';
@@ -216,19 +293,25 @@ function renderAccounts(accts){
       + '<td><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
       + '<div class="uid mono">'+esc(a.uid)+'</div></td>'
       + '<td>'+badges+(a.reason?'<div class="mono" style="margin-top:4px">'+esc(a.reason)+'</div>':'')+'</td>'
-      + '<td class="mono">'+fmt(a.credits)+'</td>'
+      + '<td class="mono">'+fmt(a.credits)+(a.credits_total?' / '+fmt(a.credits_total):'')+'</td>'
       + '<td class="mono">'+esc(exp)+'</td>'
-      + '<td class="mono">'+esc(a.machine_id||'-')+' / '+esc(a.device_id||'-')+'</td>'
+      + '<td class="mono">'+(a.in_flight||0)+' / '+(a.max_in_flight||0)+'</td>'
+      + '<td class="mono">'+esc(a.weight||1)+'</td>'
       + '<td><div class="row-actions">'
       + '<label class="toggle"><input type="checkbox" '+toggleChecked+' '+toggleDisabled+' onchange="toggleAcct(\''+esc(a.uid)+'\', this.checked)"><span class="slider"></span></label>'
       + '<button class="btn sm" onclick="refreshAcct(\''+esc(a.uid)+'\')">刷新token</button>'
+      + '<button class="btn sm" onclick="balanceAcct(\''+esc(a.uid)+'\')">刷额度</button>'
+      + (a.disabled ? '<button class="btn sm" onclick="reviveAcct(\''+esc(a.uid)+'\')">复活</button>' : '')
+      + '<button class="btn sm" onclick="pauseAcct(\''+esc(a.uid)+'\', '+(a.paused?'false':'true')+')">'+(a.paused?'恢复选号':'暂停选号')+'</button>'
+      + '<button class="btn sm" onclick="editProfile(\''+esc(a.uid)+'\')">权重/备注</button>'
+      + '<button class="btn sm" onclick="testAcct(\''+esc(a.uid)+'\')">测试</button>'
       + '<button class="btn sm" onclick="showJSON(\''+esc(a.uid)+'\')">JSON</button>'
       + '<button class="btn sm danger" onclick="deleteAcct(\''+esc(a.uid)+'\')">删除</button>'
       + '</div></td>'
       + '</tr>';
   }).join('');
   el.innerHTML = '<table class="accts"><thead><tr>'
-    + '<th>账号</th><th>状态</th><th>积分</th><th>Token 有效期</th><th>机器/设备(前8)</th><th style="text-align:right">操作</th>'
+    + '<th>账号</th><th>状态</th><th>积分</th><th>Token 有效期</th><th>在途</th><th>权重</th><th style="text-align:right">操作</th>'
     + '</tr></thead><tbody>'+rows+'</tbody></table>';
 }
 async function toggleAcct(uid, enabled){
@@ -263,6 +346,161 @@ async function showJSON(uid){
 }
 function closeModal(){ document.getElementById('modalBg').classList.remove('show'); }
 
+/* ─── 运维动作 ─── */
+async function post(path, payload){
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json', ...authHeader()},
+    body: payload===undefined? undefined : JSON.stringify(payload)});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ alert('操作失败：'+apiErr(d)); return null; }
+  return d;
+}
+async function balanceAcct(uid){
+  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/balance');
+  if(d){ loadAccounts(); }
+}
+async function pauseAcct(uid, pause){
+  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+(pause?'/pause':'/resume'));
+  if(d){ loadAccounts(); }
+}
+async function reviveAcct(uid){
+  if(!confirm('复活账号 '+uid+'？将同时清除冷却/熔断/降权状态。')) return;
+  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/revive');
+  if(d){ loadAccounts(); }
+}
+async function editProfile(uid){
+  const w = prompt('调度权重（1-100，1 = 不干预，数字越大越优先）','1');
+  if(w===null) return;
+  const n = prompt('备注（纯展示）','');
+  if(n===null) return;
+  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/profile', {weight: Number(w)||1, note: n});
+  if(d){ loadAccounts(); }
+}
+async function bulk(action){
+  const st = document.getElementById('bulkStatus');
+  st.style.display=''; st.className='login-status'; st.textContent='执行中...';
+  const d = await post('/admin/api/accounts/set_all', {action});
+  if(d){ st.className='login-status ok'; st.textContent='已处理 '+d.changed+' 个账号'; loadAccounts(); }
+  else { st.className='login-status err'; st.textContent='失败'; }
+}
+async function checkinAll(){
+  const st = document.getElementById('bulkStatus');
+  st.style.display=''; st.className='login-status'; st.textContent='签到中（并发查询上游）...';
+  const d = await post('/admin/api/checkin_all');
+  if(d){
+    const ok = (d.accounts||[]).filter(a=>!a.error).length;
+    st.className='login-status ok';
+    st.textContent = '完成：成功 '+ok+' / '+(d.accounts||[]).length;
+    loadAccounts();
+  } else { st.className='login-status err'; st.textContent='失败'; }
+}
+
+/* ─── 用量统计 ─── */
+function pct(v){ return (v==null||v===0)?'-':Number(v).toFixed(1)+'%'; }
+function cpm(v){ return (v==null||v===0)?'-':Number(v).toFixed(1); }
+async function loadUsage(){
+  const el = document.getElementById('usageTable');
+  const meta = document.getElementById('usageMeta');
+  try{
+    const r = await fetch('/admin/api/usage', {cache:'no-store'});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok){ el.innerHTML = '<div style="color:var(--bad)">'+esc(apiErr(d))+'</div>'; return; }
+    if(!d.enabled){
+      el.innerHTML = '<div style="color:var(--dim);padding:14px">用量统计未启用（config.usage.enabled=false）。</div>';
+      return;
+    }
+    meta.style.display='';
+    meta.className='login-status';
+    meta.textContent = '统计自 ' + new Date(d.snapshot.started_at).toLocaleString()
+      + ' · 积分采样' + (d.credit_sampling_enabled ? '已启用（' + d.snapshot.credit_sampling_interval_sec + 's 节流）' : '已关闭');
+    renderUsage(d.snapshot);
+  }catch(e){ el.innerHTML='<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>'; }
+}
+function renderUsage(snap){
+  const el = document.getElementById('usageTable');
+  const rows = (snap.models||[]);
+  const t = snap.totals || {};
+  if(!rows.length){
+    el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无用量数据（发一次对话后即有）。</div>';
+    return;
+  }
+  let html = '<table class="accts"><thead><tr>'
+    + '<th>模型</th><th>请求</th><th>输入 token</th><th>输出 token</th>'
+    + '<th>缓存命中</th><th>缓存率</th><th>积分/百万 token</th><th>采样</th>'
+    + '</tr></thead><tbody>';
+  for(const m of rows){
+    html += '<tr>'
+      + '<td class="mono">'+esc(m.model)+'</td>'
+      + '<td class="mono">'+fmt(m.requests)+'</td>'
+      + '<td class="mono">'+fmt(m.prompt_tokens||0)+'</td>'
+      + '<td class="mono">'+fmt(m.completion_tokens||0)+'</td>'
+      + '<td class="mono">'+fmt(m.cache_read_tokens||0)+'</td>'
+      + '<td class="mono">'+pct(m.cache_rate_pct)+'</td>'
+      + '<td class="mono">'+cpm(m.credits_per_million)+'</td>'
+      + '<td class="mono" style="color:var(--dim)" title="采样越多越可信（取中位数抗离群）">'+fmt(m.credit_samples||0)+'</td>'
+      + '</tr>';
+  }
+  // 合计行（加权，不是简单平均）
+  html += '<tr style="border-top:2px solid var(--line);font-weight:600">'
+    + '<td>'+(esc(t.model)||'合计')+'</td>'
+    + '<td class="mono">'+fmt(t.requests)+'</td>'
+    + '<td class="mono">'+fmt(t.prompt_tokens||0)+'</td>'
+    + '<td class="mono">'+fmt(t.completion_tokens||0)+'</td>'
+    + '<td class="mono">'+fmt(t.cache_read_tokens||0)+'</td>'
+    + '<td class="mono">'+pct(t.cache_rate_pct)+'</td>'
+    + '<td class="mono">'+cpm(t.credits_per_million)+'</td>'
+    + '<td class="mono" style="color:var(--dim)">'+fmt(t.credit_samples||0)+'</td>'
+    + '</tr></tbody></table>';
+  el.innerHTML = html;
+}
+
+/* ─── 请求流水 ─── */
+async function loadRequests(){
+  const q = new URLSearchParams();
+  const uid = document.getElementById('fUid').value.trim();
+  const model = document.getElementById('fModel').value.trim();
+  const outcome = document.getElementById('fOutcome').value.trim();
+  if(uid) q.set('uid', uid);
+  if(model) q.set('model', model);
+  if(outcome) q.set('outcome', outcome);
+  q.set('limit','200');
+  const el = document.getElementById('reqTable');
+  try{
+    const r = await fetch('/admin/api/requests?'+q.toString(), {cache:'no-store'});
+    const d = await r.json();
+    const ml = document.getElementById('metricsLine');
+    ml.style.display='';
+    if(!d.enabled){
+      ml.className='login-status'; ml.textContent='请求流水未启用（config reqlog.enabled）';
+      el.innerHTML=''; return;
+    }
+    const m = d.metrics||{};
+    ml.className='login-status';
+    ml.textContent = '总计 '+fmt(m.total)+' · 成功 '+fmt(m.succeeded)+' · 失败 '+fmt(m.failed)
+      + ' · 换号 '+fmt(m.rotates)+' · 平均延迟 '+fmt(Math.round(m.avg_latency_ms||0))+'ms'
+      + ' · 成功率 '+((m.success_rate||0)*100).toFixed(1)+'%'
+      + ' · 在途 '+fmt(m.in_flight);
+    const evs = d.events||[];
+    if(!evs.length){ el.innerHTML='<div style="color:var(--dim);padding:14px">暂无记录</div>'; return; }
+    el.innerHTML = '<table class="accts"><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>结果</th>'
+      + '<th>延迟</th><th>tokens</th><th>换号</th></tr></thead><tbody>'
+      + evs.map(e=>{
+          const ok = e.outcome==='success';
+          const cls = ok?'b-ok':'b-bad';
+          return '<tr>'
+            + '<td class="mono">'+esc(new Date(e.time).toLocaleTimeString())+'</td>'
+            + '<td class="mono">'+esc(e.model||'-')+'</td>'
+            + '<td class="mono">'+esc((e.nickname?e.nickname+' / ':'')+(e.uid||'-'))+'</td>'
+            + '<td class="mono">'+esc(e.status||'-')+'</td>'
+            + '<td>'+badge(e.outcome||'-', cls)+(e.error?'<div class="mono" style="color:var(--dim);margin-top:4px">'+esc(String(e.error).slice(0,80))+'</div>':'')+'</td>'
+            + '<td class="mono">'+fmt(e.latency_ms)+'ms</td>'
+            + '<td class="mono">'+fmt(e.total_tokens||0)+'</td>'
+            + '<td class="mono">'+fmt(e.rotates||0)+'</td>'
+            + '</tr>';
+        }).join('')
+      + '</tbody></table>';
+  }catch(e){ el.innerHTML='<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>'; }
+}
+
 /* ─── 导入 ─── */
 async function importCred(){
   const v = document.getElementById('impInput').value.trim();
@@ -280,12 +518,81 @@ async function importCred(){
       method:'POST', headers:{'Content-Type':contentType, ...authHeader()}, body
     });
     const d = await r.json();
-    if(!r.ok){ st.className='login-status err'; st.textContent='导入失败：'+apiErr(d); return; }
+    if(!r.ok){ st.className='login-status err'; st.textContent='导入失败：'+apiErr(d)+(d.accounts?importDetail(d):''); return; }
     st.className='login-status ok';
-    st.textContent='导入成功：'+(d.uid||'?')+'（'+(d.action||'')+'）';
+    st.textContent = d.accounts ? importSummary(d) : ('导入成功：'+(d.uid||'?')+'（'+(d.action||'')+'）');
     document.getElementById('impInput').value='';
     loadAccounts();
   }catch(e){ st.className='login-status err'; st.textContent='导入失败：'+e.message; }
+}
+
+/* 批量导入结果摘要 */
+function importSummary(d){
+  return '批量导入：共 '+(d.total||0)+' 条，新增 '+(d.created||0)+'，更新 '+(d.updated||0)+'，失败 '+(d.failed||0)+importDetail(d);
+}
+function importDetail(d){
+  const bad = (d.accounts||[]).filter(x=>x.error);
+  if(!bad.length) return '';
+  return '；失败明细：'+bad.slice(0,5).map(x=>(x.nickname||x.uid||'?')+' → '+x.error).join(' / ')+(bad.length>5?' …':'');
+}
+
+/* 文件导入：读文件内容后走同一导入通道（多文件逐个提交） */
+async function importFiles(input){
+  const files = Array.from(input.files||[]);
+  if(!files.length) return;
+  const st = document.getElementById('impStatus');
+  st.style.display=''; st.className='login-status'; st.textContent='读取 '+files.length+' 个文件...';
+  let ok=0, fail=0, lastErr='';
+  for(const f of files){
+    let text='';
+    try{ text = await f.text(); }catch(e){ fail++; lastErr=f.name+' 读取失败'; continue; }
+    try{
+      const r = await fetch('/admin/api/accounts/import', {
+        method:'POST', headers:{'Content-Type':'application/json', ...authHeader()},
+        body: JSON.stringify({json: text})
+      });
+      const d = await r.json();
+      if(!r.ok){ fail++; lastErr = f.name+'：'+apiErr(d)+(d.accounts?importDetail(d):''); }
+      else { ok += (d.total||1); }
+    }catch(e){ fail++; lastErr=f.name+'：'+e.message; }
+  }
+  st.className = fail? 'login-status err':'login-status ok';
+  st.textContent = '文件导入完成：成功 '+ok+' 条'+(fail?('，'+fail+' 个文件失败（'+lastErr+'）'):'');
+  input.value='';
+  loadAccounts();
+}
+
+async function testAcct(uid){
+  const model = prompt('用哪个模型测试连通性？（留空用默认模型）','');
+  if(model===null) return;
+  const st = document.getElementById('bulkStatus');
+  st.style.display=''; st.className='login-status'; st.textContent='测试中...';
+  const q = model.trim() ? '?model='+encodeURIComponent(model.trim()) : '';
+  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/test'+q, {
+    method:'POST', headers: authHeader()
+  });
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok){ st.className='login-status err'; st.textContent='测试失败：'+apiErr(d); return; }
+  if(d.ok){
+    st.className='login-status ok';
+    st.textContent='连通正常：'+d.model+' · '+d.latency_ms+'ms';
+  } else {
+    st.className='login-status err';
+    st.textContent='不可用：'+(d.error||'')+(d.kind?'［'+d.kind+'］':'');
+  }
+}
+async function exportCreds(){
+  const key = getKey();
+  if(!key){ alert('导出含明文 token，需要先填 API Key'); return; }
+  const r = await fetch('/admin/api/accounts/export', {headers: authHeader(), cache:'no-store'});
+  if(!r.ok){ const e = await r.json().catch(()=>({})); alert('导出失败：'+apiErr(e)); return; }
+  const blob = await r.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'trae2api-web-accounts-'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 5000);
 }
 
 /* ─── Web 登录闭环 ─── */

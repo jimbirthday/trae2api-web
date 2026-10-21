@@ -56,12 +56,23 @@ func (e *SOLOStreamError) Error() string {
 	return fmt.Sprintf("solo error code=%d msg=%s", e.Code, e.Msg)
 }
 
-// Kind 将 SSE 流内错误分类。1005 → ErrPlanLimit；其余归 ErrClient。
+// Kind 将 SSE 流内错误分类。默认 1005 → ErrPlanLimit，其余 → ErrClient；
+// 可通过 SetStreamErrorClassifier 注入自定义规则（未注入时行为不变）。
 func (e *SOLOStreamError) Kind() ErrKind {
-	if e.Code == 1005 {
-		return ErrPlanLimit
+	return classifyStreamError(e.Code, e.Msg)
+}
+
+// KindFor 按指定 client 的模型级规则判定流内错误类别。
+//
+// 为什么需要：`Kind()` 只有进程级钩子，无法感知「模型级规则表」。3003
+// （all models failed，实测表示"该账号跑不了这个模型"）若按默认口径归为
+// Client，会被当成账号级故障累计到熔断，把整个账号踢出选号池——其它模型
+// 也跟着不可用。调用方拿到 client 时应优先用本方法。
+func (e *SOLOStreamError) KindFor(c *Client) ErrKind {
+	if k := c.streamErrKind(e.Code, e.Msg); k == ErrModelBlocked {
+		return k
 	}
-	return ErrClient
+	return e.Kind()
 }
 
 // ParseSOLOLine 解析一条事件（eventName 为 event 行值，dataLine 为 data 行值）。
@@ -314,8 +325,21 @@ func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamE
 	return streamOpts(w, r, onErr)
 }
 
-// streamOpts Stream 的可选参数版本。
+// StreamWithHooks 同 StreamWithError，额外在收到 token_usage 事件时回调 onUsage。
+//
+// 流式请求的 usage 只存在于 SSE 的 event:token_usage 里，不消费这个事件就永远
+// 记不到 token 账（非流式走 Aggregate 能拿到，所以两边会不对称）。
+// onUsage 收到的是完整用量（含 cache_read_input_tokens / reasoning_tokens）。
+func StreamWithHooks(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), onUsage func(UsageDetail)) error {
+	return streamHooks(w, r, onErr, onUsage)
+}
+
 func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
+	return streamHooks(w, r, onErr, nil)
+}
+
+// streamHooks Stream 的完整可选参数版本。
+func streamHooks(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), onUsage func(UsageDetail)) error {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
@@ -408,6 +432,11 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 				}
 			case "token_usage":
 				pendingUsage = ev.Usage
+				if onUsage != nil {
+					if d, ok := UsageDetailFromEvent(ev); ok {
+						onUsage(d)
+					}
+				}
 			case "done":
 				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
 					return err

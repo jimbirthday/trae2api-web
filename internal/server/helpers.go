@@ -1,4 +1,4 @@
-﻿// helpers.go admin 子包共用的小工具。
+// helpers.go admin 子包共用的小工具。
 package server
 
 import (

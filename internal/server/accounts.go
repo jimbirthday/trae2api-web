@@ -1,4 +1,4 @@
-﻿// accounts.go /admin/api/accounts 全套：列表 / 导入 / 删除 / PATCH 开关 / 刷新 / JSON 脱敏预览。
+// accounts.go /admin/api/accounts 全套：列表 / 导入 / 删除 / PATCH 开关 / 刷新 / JSON 脱敏预览。
 //
 // 安全纪律（PLAN §4）：
 //   - 列表与 JSON 预览绝不返回完整 token，只给前缀 + 长度
@@ -7,6 +7,7 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"strings"
 
 	"trae2api-web/internal/auth"
+	"trae2api-web/internal/pool"
 )
 
 // accountSummary 列表/预览对外结构（脱敏）。
@@ -22,18 +24,32 @@ type accountSummary struct {
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname,omitempty"`
 	EnterpriseID string `json:"enterprise_id,omitempty"`
+	Weight       int    `json:"weight,omitempty"`
+	Note         string `json:"note,omitempty"`
+	HasTokens    bool   `json:"has_tokens"`
 	Enabled      bool   `json:"enabled"`
 	Disabled     bool   `json:"disabled"` // session dead 硬禁用
+	Paused       bool   `json:"paused,omitempty"`
 	Cooling      bool   `json:"cooling"`
+	CoolKind     string `json:"cool_kind,omitempty"`
+	CoolRemain   int64  `json:"cool_remaining_sec,omitempty"`
 	Reason       string `json:"reason,omitempty"`
 	Credits      int64  `json:"credits"`
+	CreditsTotal int64  `json:"credits_total,omitempty"`
 	ErrCount     int    `json:"err_count,omitempty"`
+	ErrTotal     int64  `json:"err_total,omitempty"`
+	SuccessCount int64  `json:"success_count,omitempty"`
+	InFlight     int    `json:"in_flight"`
+	MaxInFlight  int    `json:"max_in_flight,omitempty"`
+	// RateLimited 模型级限额行（模型、类型、恢复时刻）。
+	ModelBlocked []pool.RateLimitedModel `json:"model_blocked,omitempty"`
 	// Token 有效期（Unix 秒）与是否临近过期
-	ExpiresAt    int64  `json:"expires_at,omitempty"`
-	ExpiredSoon  bool   `json:"expired_soon,omitempty"`
-	MachineID    string `json:"machine_id,omitempty"` // 前 8 位（脱敏）
-	DeviceID     string `json:"device_id,omitempty"`  // 前 8 位（脱敏）
-	HasAuth      bool   `json:"has_auth"`
+	ExpiresAt   int64  `json:"expires_at,omitempty"`
+	ExpiredSoon bool   `json:"expired_soon,omitempty"`
+	MachineID   string `json:"machine_id,omitempty"` // 前 8 位（脱敏）
+	DeviceID    string `json:"device_id,omitempty"`  // 前 8 位（脱敏）
+	Cookies     int    `json:"cookies,omitempty"`    // 存档的浏览器 cookie 数
+	HasAuth     bool   `json:"has_auth"`
 }
 
 // adminAccounts GET /admin/api/accounts：列表（无鉴权，只读）。
@@ -42,14 +58,27 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	out := make([]accountSummary, 0, len(statuses))
 	for _, s := range statuses {
 		sum := accountSummary{
-			UID:       s.UID,
-			Nickname:  s.Nickname,
-			Enabled:   s.Enabled,
-			Disabled:  s.Disabled,
-			Cooling:   s.Cooling,
-			Reason:    s.Reason,
-			Credits:   s.Credits,
-			ErrCount:  s.ErrCount,
+			UID:          s.UID,
+			Nickname:     s.Nickname,
+			EnterpriseID: s.EnterpriseID,
+			Weight:       s.Weight,
+			Note:         s.Note,
+			HasTokens:    s.HasTokens,
+			Enabled:      s.Enabled,
+			Disabled:     s.Disabled,
+			Paused:       s.Paused,
+			Cooling:      s.Cooling,
+			CoolKind:     s.CoolKind,
+			CoolRemain:   s.CoolRemaining,
+			Reason:       s.Reason,
+			Credits:      s.Credits,
+			CreditsTotal: s.CreditsTotal,
+			ErrCount:     s.ConsecutiveFails,
+			ErrTotal:     s.ErrTotal,
+			SuccessCount: s.SuccessCount,
+			InFlight:     s.InFlight,
+			MaxInFlight:  h.cfg.Pool.MaxInFlight(),
+			ModelBlocked: s.RateLimitedModels,
 		}
 		if a := h.cfg.Pool.AuthByUID(s.UID); a != nil {
 			sum.HasAuth = true
@@ -59,6 +88,7 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 			}
 			sum.MachineID = prefix(a.MachineID, 8)
 			sum.DeviceID = prefix(a.DeviceID, 8)
+			sum.Cookies = a.CookieCount()
 		}
 		out = append(out, sum)
 	}
@@ -80,10 +110,10 @@ type importRequest struct {
 
 // importResult 导入结果。
 type importResult struct {
-	UID       string `json:"uid"`
-	Nickname  string `json:"nickname,omitempty"`
-	Action    string `json:"action"` // "created" | "updated"
-	NeedsCheck bool  `json:"needs_check,omitempty"` // 建议用户确认额度
+	UID        string `json:"uid"`
+	Nickname   string `json:"nickname,omitempty"`
+	Action     string `json:"action"`                // "created" | "updated"
+	NeedsCheck bool   `json:"needs_check,omitempty"` // 建议用户确认额度
 }
 
 // adminImportAccount POST /admin/api/accounts/import：导入凭证。
@@ -109,6 +139,13 @@ func (h *Handler) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 
 	if h.cfg.AuthDir == "" {
 		writeOpenAIError(w, http.StatusInternalServerError, "no_auth_dir", "server AuthDir not configured")
+		return
+	}
+
+	// 批量通道：中转面板导出格式（trae-cn-relay-accounts）。
+	// 两种入口都收：包在 {"json": "..."} 里，或整个 body 就是该 JSON。
+	if raw := relayPayload(req, body); raw != nil {
+		h.importRelayBatch(w, raw)
 		return
 	}
 
@@ -161,8 +198,8 @@ func (h *Handler) importFromCallback(req importRequest) (*auth.Auth, error) {
 	a := &auth.Auth{
 		AccessToken:  info.AccessToken,
 		RefreshToken: info.RefreshToken,
-		UID:         info.UID,
-		Nickname:    info.Nickname,
+		UID:          info.UID,
+		Nickname:     info.Nickname,
 		EnterpriseID: info.EnterpriseID,
 		Domain:       "trae.cn",
 		ApiHost:      "https://api.trae.com.cn",
@@ -311,9 +348,9 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	st, _ := h.cfg.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"uid":       uid,
+		"uid":        uid,
 		"expires_at": a.ExpiresAt,
-		"status":    st,
+		"status":     st,
 	})
 }
 
@@ -336,6 +373,7 @@ func (h *Handler) adminAccountJSON(w http.ResponseWriter, r *http.Request) {
 		"access_token":  auth.MaskToken(a.JWT(), 12),
 		"refresh_token": auth.MaskToken(a.RefreshTokenValue(), 12),
 		"expires_at":    a.ExpiresAt,
+		"cookies":       a.CookieCount(),
 		"file_path":     a.FilePath,
 	})
 }
@@ -379,4 +417,111 @@ func isSessionDeadErr(err error) bool {
 		}
 	}
 	return false
+}
+
+// relayPayload 判断本次导入是否走批量通道，返回待解析的原始 JSON。
+// 判定顺序：{"json":...} 里的内容 → 整个 body。都不是中转格式则返回 nil（回落单条逻辑）。
+func relayPayload(req importRequest, body []byte) []byte {
+	if req.CallbackURL != "" {
+		return nil // 回调链接优先，绝不按批量处理
+	}
+	cand := []byte(strings.TrimSpace(req.JSON))
+	if len(cand) == 0 {
+		cand = bytes.TrimSpace(body)
+	}
+	if len(cand) == 0 || (cand[0] != '{' && cand[0] != '[') {
+		return nil
+	}
+	// 本仓库嵌套形含 "auth" 键，绝不误判
+	if bytes.Contains(cand, []byte(`"auth"`)) && !bytes.Contains(cand, []byte(`"accounts"`)) {
+		return nil
+	}
+	// 支持：整包 {"accounts":[..]}、顶层数组 [..]、多条格式 A/B 首尾相接的文件内容。
+	if !auth.HasAccounts(cand) {
+		return nil
+	}
+	return cand
+}
+
+// importRelayBatch 批量导入中转格式账号：逐条落盘 + 入池，返回逐条结果。
+// 单条失败不影响其余；全部失败时返回 400。
+func (h *Handler) importRelayBatch(w http.ResponseWriter, raw []byte) {
+	list, err := auth.ParseAnyAccounts(raw)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "import_failed", err.Error())
+		return
+	}
+	if err := os.MkdirAll(h.cfg.AuthDir, 0o755); err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "mkdir_failed", err.Error())
+		return
+	}
+	results := make([]map[string]any, 0, len(list))
+	created, updated, failed := 0, 0, 0
+	seen := make(map[string]bool, len(list))
+	for _, a := range list {
+		item := map[string]any{"uid": a.UID, "nickname": a.Nickname}
+		if a.UID == "" {
+			// 中转格式缺 uid 时向上游补一次（不阻塞整体导入）
+			if uid, nick, ent, ierr := h.cfg.Upstream.GetUserInfo(a); ierr == nil && uid != "" {
+				a.UID = uid
+				if a.Nickname == "" {
+					a.Nickname = nick
+				}
+				a.EnterpriseID = ent
+				item["uid"] = a.UID
+				item["nickname"] = a.Nickname
+			}
+		}
+		if a.UID == "" {
+			item["error"] = "cannot determine uid"
+			results = append(results, item)
+			failed++
+			continue
+		}
+		if seen[a.UID] {
+			item["error"] = "duplicate uid in payload"
+			results = append(results, item)
+			failed++
+			continue
+		}
+		seen[a.UID] = true
+
+		a.FilePath = auth.FilePathFor(h.cfg.AuthDir, a.UID)
+		_, statErr := os.Stat(a.FilePath)
+		if err := a.SaveAtomic(); err != nil {
+			item["error"] = "save_failed: " + err.Error()
+			results = append(results, item)
+			failed++
+			continue
+		}
+		h.cfg.Pool.Add(a)
+		if a.ImportDisabled {
+			// 导出文件里 enabled=false → 导入后保持停用（仍落盘，便于后续手动启用）。
+			h.cfg.Pool.SetEnabled(a.UID, false, "disabled in import file")
+			item["enabled"] = false
+		}
+		if n := a.CookieCount(); n > 0 {
+			item["cookies"] = n
+		}
+		if statErr == nil {
+			item["action"] = "updated"
+			updated++
+		} else {
+			item["action"] = "created"
+			created++
+		}
+		results = append(results, item)
+	}
+	out := map[string]any{
+		"total":    len(list),
+		"created":  created,
+		"updated":  updated,
+		"failed":   failed,
+		"accounts": results,
+	}
+	if created+updated == 0 {
+		writeJSON(w, http.StatusBadRequest, out)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }

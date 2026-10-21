@@ -1,4 +1,4 @@
-﻿// 管理面板（/admin）：只读查询，无鉴权（本地面板）；CLI 操作留待开发。
+// 管理面板（/admin）：只读查询，无鉴权（本地面板）；CLI 操作留待开发。
 package server
 
 import (
@@ -12,6 +12,17 @@ import (
 
 //go:embed admin.html
 var adminPageHTML []byte
+
+// adminPageGated 面板首页：未登录返回登录页，已登录返回控制台 HTML。
+// 页面本身不含任何数据（数据全靠 /admin/api/* 拉取），所以未登录返回登录页
+// 即可完全阻断「先看到页面」这条路。
+func (h *Handler) adminPageGated(w http.ResponseWriter, r *http.Request) {
+	if !h.adminAuthorized(r) {
+		adminLoginHTML(w, http.StatusUnauthorized, "")
+		return
+	}
+	h.adminPage(w, r)
+}
 
 // adminPage 返回内嵌 HTML 面板（深色简洁风，无外部依赖）。
 func (h *Handler) adminPage(w http.ResponseWriter, r *http.Request) {
@@ -59,6 +70,14 @@ func (h *Handler) adminCredits(w http.ResponseWriter, r *http.Request) {
 				ac.Error = "ent_usage: " + err.Error()
 			} else {
 				ac.Remain, ac.Limit, ac.Used, ac.Packs = remain, limit, used, packs
+				// 回写 pool：查询额度是刷新调度状态的机会，不回写会导致面板显示
+				// 4743 而选号权重仍按旧值（甚至 0）计算，且冷却号不会自动解冻。
+				total := limit
+				if total < remain {
+					total = remain
+				}
+				h.cfg.Pool.SetCreditsDetailed(s.UID, remain, total, 0, time.Time{}, 0)
+				h.cfg.Pool.ReenableIfCredits(s.UID, remain)
 			}
 			checkedIn, credits, enable, cerr := h.cfg.Upstream.CheckinStatus(a)
 			if cerr != nil {

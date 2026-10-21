@@ -33,7 +33,48 @@ type Auth struct {
 	UID          string
 	EnterpriseID string
 	Nickname     string
-	FilePath     string // 落盘路径；refresh 后原子写回
+	Cookies      []Cookie // 第三方导出格式自带的浏览器 cookie（仅存档，不参与出站请求头）
+	FilePath     string   // 落盘路径；refresh 后原子写回
+
+	// ImportDisabled 仅供导入通道使用（JSON 里 enabled=false），不落盘、不参与调度判定。
+	ImportDisabled bool `json:"-"`
+
+	// Weight 手动调度权重（1-100，1 = 不干预）。随凭证档持久化在 account.weight。
+	Weight int `json:"-"`
+	// Note 账号备注（面板自填，纯展示不参与选号），持久化在 account.note。
+	Note string `json:"-"`
+}
+
+// Cookie 浏览器登录态 cookie（第三方导出格式带出来的原始项）。
+// 当前上游链路只依赖 Cloud-IDE-JWT / X-Uid 等请求头，cookie 仅做存档：
+// 既能完整回写凭证文件（便于导出/迁移），也为将来需要 X-Cloudide-Session 的端点留好数据。
+type Cookie struct {
+	Name     string `json:"name"`
+	Value    string `json:"value"`
+	HostKey  string `json:"host_key,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Expires  int64  `json:"expires_utc,omitempty"`
+	Secure   bool   `json:"is_secure,omitempty"`
+	HTTPOnly bool   `json:"is_httponly,omitempty"`
+}
+
+// CookieValue 按名字查 cookie 值（找不到返回空串）。
+func (a *Auth) CookieValue(name string) string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	for _, c := range a.Cookies {
+		if c.Name == name {
+			return c.Value
+		}
+	}
+	return ""
+}
+
+// CookieCount 返回存档 cookie 数量（面板展示用）。
+func (a *Auth) CookieCount() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return len(a.Cookies)
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加写锁。
@@ -47,6 +88,91 @@ func (a *Auth) RLock() { a.mu.RLock() }
 
 // RUnlock 释放 a.RLock 获取的读锁。
 func (a *Auth) RUnlock() { a.mu.RUnlock() }
+
+// AccessTokenValue 加锁读取 accessToken（出站请求头一律经此取值，勿直读字段）。
+func (a *Auth) AccessTokenValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.AccessToken
+}
+
+// Realm 返回账号域。TRAE 当前只有 CN 单域（不做多租户/双域），恒为 "cn"。
+// 保留此方法是为了让调度层（pool/session）的接口与未来国际版扩展一致。
+func (a *Auth) Realm() string { return "cn" }
+
+// IsEnterprise 报告账号是否为企业版。TRAE 暂无企业号体系，恒为 false；
+// 保留以便调度层按统一口径跳过企业专属任务。
+func (a *Auth) IsEnterprise() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return strings.TrimSpace(a.EnterpriseID) != ""
+}
+
+// WeightValue 返回归一化后的手动调度权重：1 = 不干预，2-100 = 更高优先级。
+func (a *Auth) WeightValue() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return NormalizeWeight(a.Weight)
+}
+
+// SetWeight 设置手动调度权重，越界值收敛而非报错。
+func (a *Auth) SetWeight(weight int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Weight = NormalizeWeight(weight)
+}
+
+// SetNote 设置账号备注（纯展示，截断到 200 rune）。
+func (a *Auth) SetNote(note string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Note = NormalizeNote(note)
+}
+
+// ProfileSnapshot 返回面板展示需要的账号资料快照（weight/note/nickname/realm）。
+func (a *Auth) ProfileSnapshot() (weight int, note, nickname, realm string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return NormalizeWeight(a.Weight), a.Note, a.Nickname, "cn"
+}
+
+// SetProfile 原子更新面板可编辑的账号资料（nil 表示该字段不变）并落盘。
+// 只允许改 weight/note：与 token 刷新共用 a.mu，避免 refresh 写回时用旧值覆盖。
+func (a *Auth) SetProfile(weight *int, note *string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if weight != nil {
+		a.Weight = NormalizeWeight(*weight)
+	}
+	if note != nil {
+		a.Note = NormalizeNote(*note)
+	}
+	return a.saveAtomicLocked()
+}
+
+// NormalizeWeight 把任意权重收敛到 [1,100]；0/负数/异常值回落 1（不干预）。
+func NormalizeWeight(w int) int {
+	if w < 1 {
+		return 1
+	}
+	if w > 100 {
+		return 100
+	}
+	return w
+}
+
+// NormalizeNote 去首尾空白并截断到 200 rune（按 rune 切，避免切坏中文）。
+func NormalizeNote(note string) string {
+	note = strings.TrimSpace(note)
+	if len(note) <= 200 {
+		return note
+	}
+	r := []rune(note)
+	if len(r) > 200 {
+		r = r[:200]
+	}
+	return string(r)
+}
 
 // JWT 返回当前 accessToken 的读锁快照，防与 RefreshToken 写并发竞态。
 func (a *Auth) JWT() string {
@@ -83,18 +209,21 @@ func (a *Auth) NeedsRefreshLocked(within time.Duration) bool {
 func parseNested(raw []byte) (*Auth, error) {
 	var n struct {
 		Auth struct {
-			AccessToken  string `json:"accessToken"`
-			RefreshToken string `json:"refreshToken"`
-			ExpiresAt    int64  `json:"expiresAt"`
-			Domain       string `json:"domain"`
-			ApiHost      string `json:"apiHost"`
-			MachineID    string `json:"machineId"`
-			DeviceID     string `json:"deviceId"`
+			AccessToken  string   `json:"accessToken"`
+			RefreshToken string   `json:"refreshToken"`
+			ExpiresAt    int64    `json:"expiresAt"`
+			Domain       string   `json:"domain"`
+			ApiHost      string   `json:"apiHost"`
+			MachineID    string   `json:"machineId"`
+			DeviceID     string   `json:"deviceId"`
+			Cookies      []Cookie `json:"cookies"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
+			Weight       int    `json:"weight"`
+			Note         string `json:"note"`
 		} `json:"account"`
 	}
 	if err := json.Unmarshal(raw, &n); err != nil {
@@ -108,9 +237,12 @@ func parseNested(raw []byte) (*Auth, error) {
 		ApiHost:      n.Auth.ApiHost,
 		MachineID:    n.Auth.MachineID,
 		DeviceID:     n.Auth.DeviceID,
+		Cookies:      n.Auth.Cookies,
 		UID:          n.Account.UID,
 		EnterpriseID: n.Account.EnterpriseID,
 		Nickname:     n.Account.Nickname,
+		Weight:       NormalizeWeight(n.Account.Weight),
+		Note:         NormalizeNote(n.Account.Note),
 	}, nil
 }
 
@@ -119,16 +251,19 @@ func parseNested(raw []byte) (*Auth, error) {
 //	{"accessToken":...,"uid":...,"machineId":...,"deviceId":...}
 func parseFlat(raw []byte) (*Auth, error) {
 	var f struct {
-		AccessToken  string `json:"accessToken"`
-		RefreshToken string `json:"refreshToken"`
-		ExpiresAt    int64  `json:"expiresAt"`
-		Domain       string `json:"domain"`
-		ApiHost      string `json:"apiHost"`
-		MachineID    string `json:"machineId"`
-		DeviceID     string `json:"deviceId"`
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
+		AccessToken  string   `json:"accessToken"`
+		RefreshToken string   `json:"refreshToken"`
+		ExpiresAt    int64    `json:"expiresAt"`
+		Domain       string   `json:"domain"`
+		ApiHost      string   `json:"apiHost"`
+		MachineID    string   `json:"machineId"`
+		DeviceID     string   `json:"deviceId"`
+		Cookies      []Cookie `json:"cookies"`
+		UID          string   `json:"uid"`
+		EnterpriseID string   `json:"enterpriseId"`
+		Nickname     string   `json:"nickname"`
+		Weight       int      `json:"weight"`
+		Note         string   `json:"note"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -141,9 +276,12 @@ func parseFlat(raw []byte) (*Auth, error) {
 		ApiHost:      f.ApiHost,
 		MachineID:    f.MachineID,
 		DeviceID:     f.DeviceID,
+		Cookies:      f.Cookies,
 		UID:          f.UID,
 		EnterpriseID: f.EnterpriseID,
 		Nickname:     f.Nickname,
+		Weight:       NormalizeWeight(f.Weight),
+		Note:         NormalizeNote(f.Note),
 	}, nil
 }
 
@@ -185,6 +323,14 @@ func (a *Auth) SaveAtomic() error {
 	return a.saveAtomicLocked()
 }
 
+// cookiesForSave 返回不入库的空安全 cookie 切片（nil → 空数组，保持文件结构稳定）。
+func (a *Auth) cookiesForSave() []Cookie {
+	if len(a.Cookies) == 0 {
+		return []Cookie{}
+	}
+	return a.Cookies
+}
+
 // saveAtomicLocked 是 SaveAtomic 的持锁内部版本；调用方必须已持有 a.mu。
 func (a *Auth) saveAtomicLocked() error {
 	if a.FilePath == "" {
@@ -199,11 +345,14 @@ func (a *Auth) saveAtomicLocked() error {
 			"apiHost":      a.ApiHost,
 			"machineId":    a.MachineID,
 			"deviceId":     a.DeviceID,
+			"cookies":      a.cookiesForSave(),
 		},
 		"account": map[string]any{
 			"uid":          a.UID,
 			"enterpriseId": a.EnterpriseID,
 			"nickname":     a.Nickname,
+			"weight":       NormalizeWeight(a.Weight),
+			"note":         NormalizeNote(a.Note),
 		},
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")

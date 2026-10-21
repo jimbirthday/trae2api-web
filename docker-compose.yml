@@ -1,13 +1,32 @@
+# 从源码构建并启动：docker compose up -d --build
+# 默认监听 host 8000 → 容器 8000。
 services:
   tw2api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: trae2api-web:local
     container_name: trae2api-web
     restart: unless-stopped
     environment:
-      - TZ=Asia/Shanghai
-      - TW2A_API_KEY=${TW2A_API_KEY:?set TW2A_API_KEY in .env or shell}   # key 走 env，不落盘 git
+      - TZ=${TZ:-Asia/Shanghai}
+      # 服务鉴权 key：务必改成自己的随机串（面板/API 都用它）
+      - TW2A_API_KEY=${TW2A_API_KEY:-changeme}
+      # 容器内固定 8000，与下面 ports 映射保持一致
+      - TW2A_LISTEN=:8000
+      # TRAE 登录回调端口（容器内起 127.0.0.1:18080；面板手动粘贴回调链接时可忽略）
+      - TW2A_CALLBACK_PORT=${TW2A_CALLBACK_PORT:-18080}
     ports:
-      - "7864:7864"
+      - "${TW2A_PORT:-8000}:8000"
     volumes:
+      # 账号凭证与运行态（state/usage/流水）持久化到宿主
       - ./auths:/app/auths
       - ./data:/app/data
+      # 想用宿主 config.json 覆盖默认配置时，取消下一行注释
+      # - ./config.json:/app/config.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s

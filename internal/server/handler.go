@@ -1,19 +1,20 @@
-﻿// Package server 暴露 OpenAI 兼容 HTTP 接口，内部驱动 pool 挑号 + upstream 转发。
+// Package server 暴露 OpenAI 兼容 HTTP 接口，内部驱动 pool 挑号 + upstream 转发。
 package server
 
 import (
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"trae2api-web/internal/pool"
+	"trae2api-web/internal/reqlog"
+	"trae2api-web/internal/session"
 	"trae2api-web/internal/upstream"
+	"trae2api-web/internal/usage"
 )
 
 // Config handler 依赖。
@@ -29,6 +30,17 @@ type Config struct {
 	ErrCooldown  time.Duration // 错误冷却，默认 10m
 	RefreshSkew  time.Duration // token 预刷新窗口，默认 24h
 	DefaultModel string        // 默认 glm-5.2
+
+	// Session 会话粘性路由（nil = 关闭粘性，每次请求独立选号）。
+	Session *session.Router
+	// RequestLog 请求流水记录器（nil = 不记录）。
+	RequestLog *reqlog.Recorder
+	// Usage 用量统计（按模型累计 token/缓存/积分采样；nil = 不统计）。
+	Usage *usage.Tracker
+	// CreditSampler 积分采样器（nil = 不采样积分，则「积分/百万」显示为空）。
+	CreditSampler *usage.Sampler
+	// ConfigPath config.json 路径（面板保存配置用；空 = 禁用写回）。
+	ConfigPath string
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -42,7 +54,7 @@ type Handler struct {
 	// Web 登录 pending 态：pendingID → 登录进行中的临时上下文。
 	// 回调 /authorize 捕获后标记成功；面板轮询 result 取结果。
 	loginMu sync.Mutex
-	logins   map[string]*pendingLogin
+	logins  map[string]*pendingLogin
 }
 
 // NewHandler 构建 handler。
@@ -76,23 +88,54 @@ func NewHandler(cfg Config) *Handler {
 	// 管理面板：本地面板
 	// 读接口无鉴权（局域网内只读）；写接口（accounts 写/login/refresh/authorize）
 	// 经 withAdminAuth 校验 Bearer = TW2A_API_KEY（见 §4 安全设计）。
-	h.mux.HandleFunc("GET /admin", h.adminPage)
-	h.mux.HandleFunc("GET /admin/api/credits", h.adminCredits)
+	h.mux.HandleFunc("GET /admin", h.adminPageGated)
+	h.mux.HandleFunc("GET /admin/api/credits", h.adminReadAuth(h.adminCredits))
 	// 账号 CRUD
-	h.mux.HandleFunc("GET /admin/api/accounts", h.adminAccounts)
+	h.mux.HandleFunc("GET /admin/api/accounts", h.adminReadAuth(h.adminAccounts))
 	h.mux.HandleFunc("POST /admin/api/accounts/import", h.withAdminAuth(h.adminImportAccount))
 	h.mux.HandleFunc("DELETE /admin/api/accounts/{uid}", h.withAdminAuth(h.adminDeleteAccount))
 	h.mux.HandleFunc("PATCH /admin/api/accounts/{uid}", h.withAdminAuth(h.adminPatchAccount))
 	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/refresh", h.withAdminAuth(h.adminRefreshAccount))
-	h.mux.HandleFunc("GET /admin/api/accounts/{uid}/json", h.adminAccountJSON)
+	h.mux.HandleFunc("GET /admin/api/accounts/{uid}/json", h.adminReadAuth(h.adminAccountJSON))
+	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/pause", h.withAdminAuth(h.adminPauseAccount))
+	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/resume", h.withAdminAuth(h.adminResumeAccount))
+	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/revive", h.withAdminAuth(h.adminReviveAccount))
+	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/profile", h.withAdminAuth(h.adminAccountProfile))
+	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/balance", h.withAdminAuth(h.adminAccountBalance))
+	h.mux.HandleFunc("POST /admin/api/accounts/set_all", h.withAdminAuth(h.adminAccountsSetAll))
+	h.mux.HandleFunc("GET /admin/api/accounts/export", h.withAdminAuth(h.adminExportAccounts))
+	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/test", h.withAdminAuth(h.adminAccountTest))
+	h.mux.HandleFunc("POST /admin/api/checkin_all", h.withAdminAuth(h.adminCheckinAll))
+	h.mux.HandleFunc("GET /admin/api/requests", h.adminReadAuth(h.adminRequests))
+	h.mux.HandleFunc("GET /admin/api/metrics", h.adminReadAuth(h.adminMetrics))
+	h.mux.HandleFunc("GET /admin/api/config", h.adminReadAuth(h.adminGetConfig))
+	h.mux.HandleFunc("POST /admin/api/config", h.withAdminAuth(h.adminSaveConfig))
+	// 面板会话：POST /admin/api/session 用 key 换 cookie（登录），DELETE 退出。
+	h.mux.HandleFunc("POST /admin/api/session", h.adminSession)
+	h.mux.HandleFunc("DELETE /admin/api/session", h.adminLogout)
+	// 用量统计（按模型 token/缓存/积分）
+	h.mux.HandleFunc("GET /admin/api/usage", h.adminReadAuth(h.adminUsage))
 	// Web 登录闭环
 	h.mux.HandleFunc("POST /admin/api/login", h.withAdminAuth(h.adminLoginStart))
-	h.mux.HandleFunc("GET /admin/api/login/result", h.adminLoginResult)
+	h.mux.HandleFunc("GET /admin/api/login/result", h.adminReadAuth(h.adminLoginResult))
 	h.mux.HandleFunc("POST /admin/api/login/cancel", h.withAdminAuth(h.adminLoginCancel))
 	// TRAE 回调落点（/authorize）：无需 Bearer（TRAE 浏览器 302 不带 key），
 	// 仅捕获 query 写 pending 队列，不直接落盘 token。
 	h.mux.HandleFunc("GET /authorize", h.authorizeCallback)
 	return h
+}
+
+// adminReadAuth 校验面板**读**接口的访问权（Bearer 或登录 cookie）。
+// 与 withAdminAuth 的区别：除 Bearer 外还接受浏览器 cookie 会话，
+// 这样浏览器登录一次后所有列表/流水/统计接口都能直接用。
+func (h *Handler) adminReadAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.adminAuthorized(r) {
+			next(w, r)
+			return
+		}
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "需要 API Key 才能访问控制台数据")
+	}
 }
 
 // withAdminAuth 校验写操作的 Bearer API Key（常量时间比较，复用 withAuth 逻辑）。
@@ -149,8 +192,18 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
+	counts := h.cfg.Pool.Counts()
+	sessionCount := 0
+	if h.cfg.Session != nil {
+		sessionCount = h.cfg.Session.Count()
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts": h.cfg.Pool.List(),
+		"accounts":         h.cfg.Pool.List(),
+		"counts":           counts,
+		"sticky_sessions":  sessionCount,
+		"max_rotate":       h.cfg.MaxRotate,
+		"default_model":    h.cfg.DefaultModel,
+		"refresh_skew_sec": int64(h.cfg.RefreshSkew / time.Second),
 	})
 }
 
@@ -299,7 +352,10 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	// 用 Peek（只读选号）：拉模型表是辅助调用，不能提交 lastUsed/usedSeq，
+	// 否则每个 chat 请求都会因 mapModel→knownModel→modelList 触发一次隐式选号，
+	// 污染闲置补偿并让轮换次序错乱。
+	acct := h.cfg.Pool.Peek("")
 	if acct == nil {
 		return nil
 	}
@@ -334,135 +390,6 @@ func setModelInBody(body []byte, configName string) []byte {
 		return body
 	}
 	return out
-}
-
-func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
-		return
-	}
-	if len(body) > maxBodyBytes {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
-		return
-	}
-	var peek struct {
-		Stream bool   `json:"stream"`
-		Model  string `json:"model"`
-	}
-	_ = json.Unmarshal(body, &peek)
-
-	configName, err := h.mapModel(peek.Model)
-	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	body = setModelInBody(body, configName)
-
-	tried := map[string]bool{}
-	var lastErr error
-	for i := 0; i < h.cfg.MaxRotate; i++ {
-		acct := h.cfg.Pool.PickExcluding(tried)
-		if acct == nil {
-			break
-		}
-		tried[acct.UID] = true
-
-		// token 临近过期 → 先 refresh（持锁重查，避免并发重复轮换；失败冷却换号）
-		refreshed, err := h.cfg.Upstream.RefreshTokenIfNeeded(acct, h.cfg.RefreshSkew)
-		if err != nil {
-			lastErr = err
-			var ue *upstream.Error
-			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
-				h.cfg.Pool.Disable(acct.UID, "refresh session dead")
-			} else {
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolErr, h.cfg.ErrCooldown, "refresh: "+err.Error())
-			}
-			continue
-		}
-		if refreshed {
-			_ = acct.SaveAtomic()
-		}
-
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
-		if terr != nil {
-			lastErr = terr
-			h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-			continue
-		}
-		if status >= 400 {
-			kind := upstream.Classify(status, string(respBody))
-			switch kind {
-			case upstream.ErrPlanLimit:
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			case upstream.ErrSoftRate:
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "429 rate limit")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			case upstream.ErrSessionDead:
-				h.cfg.Pool.Disable(acct.UID, "session dead")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			case upstream.ErrNotFound:
-				// 404 短冷却不累计 errCount（防雪崩）
-				h.cfg.Pool.Cooldown(acct.UID, pool.CoolSoft, h.cfg.SoftCooldown, "upstream 404")
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			default:
-				h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-				lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-				continue
-			}
-		}
-		if peek.Stream {
-			h.cfg.Pool.NoteSuccess(acct.UID)
-			// 流内业务错误（1005 plan/5xx 等）→ 冷却账号，错误信息注入 SSE。
-			_ = upstream.StreamWithError(w, rc, func(se *upstream.SOLOStreamError) {
-				h.handleStreamError(acct.UID, se)
-			})
-			rc.Close()
-			return
-		}
-		resp, err := upstream.Aggregate(rc)
-		rc.Close() // 已完全消费，立即释放上游连接（防轮转 continue 泄漏 body）
-		if err != nil {
-			// 流内业务错误（如 1005 plan 权益不足）→ 冷却账号并轮转下一账号。
-			var se *upstream.SOLOStreamError
-			if errors.As(err, &se) {
-				lastErr = err
-				switch se.Kind() {
-				case upstream.ErrPlanLimit:
-					h.cfg.Pool.Cooldown(acct.UID, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
-				default:
-					h.cfg.Pool.NoteError(acct.UID, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-				}
-				continue
-			}
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
-			return
-		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		writeJSON(w, http.StatusOK, resp)
-		return
-	}
-	msg := "all accounts unavailable (cooling/disabled)"
-	if lastErr != nil {
-		msg += ": " + lastErr.Error()
-	}
-	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
-}
-
-// handleStreamError 流式响应中的上游业务错误 → pool 冷却状态机。
-// 1005 plan 权益不足 → 长冷却；其余（5xx/参数错误等）→ 累计错误冷却。
-func (h *Handler) handleStreamError(uid string, se *upstream.SOLOStreamError) {
-	switch se.Kind() {
-	case upstream.ErrPlanLimit:
-		h.cfg.Pool.Cooldown(uid, pool.CoolPlan, h.cfg.PlanCooldown, "plan 权益不足")
-	default:
-		h.cfg.Pool.NoteError(uid, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
-	}
 }
 
 // ---------------------------------------------------------------------------

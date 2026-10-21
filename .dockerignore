@@ -1,5 +1,6 @@
 auths/
 data/
+logs/
 docs/
 *.key
 *.pem
@@ -10,9 +11,13 @@ config.json
 .env
 *.tmp
 __pycache__/
+tickets/
+reference_workbuddy2api/
+# 本机编译产物，别进构建上下文
+trae2api-web
+tw2api
 login
 signin
 credit
 signin_bin
-tw2api
 server

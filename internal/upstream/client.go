@@ -1,9 +1,10 @@
-﻿// client.go SOLO 上游客户端：llm_utils_chat / get_detail_param / ExchangeToken /
+// client.go SOLO 上游客户端：llm_utils_chat / get_detail_param / ExchangeToken /
 // checkin_credits / ide_user_ent_usage + 错误分类。
 package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,13 +20,14 @@ import (
 type ErrKind int
 
 const (
-	ErrNone        ErrKind = iota // 成功
-	ErrPlanLimit                  // 1005 + plan → 权益不足（硬冷却 12h）
-	ErrSoftRate                   // 429 → 短冷却 60s
-	ErrSessionDead                // 401 + Cloud-IDE-JWT 失效 → 禁用
-	ErrNotFound                   // 404 → 短冷却 60s 不累计 errCount
-	ErrServer                     // 5xx
-	ErrClient                     // 其他 4xx
+	ErrNone         ErrKind = iota // 成功
+	ErrPlanLimit                   // 1005 + plan → 权益不足（硬冷却 12h）
+	ErrSoftRate                    // 429 → 短冷却 60s
+	ErrSessionDead                 // 401 + Cloud-IDE-JWT 失效 → 禁用
+	ErrNotFound                    // 404 → 短冷却 60s 不累计 errCount
+	ErrServer                      // 5xx
+	ErrClient                      // 其他 4xx
+	ErrModelBlocked                // 模型级不可用（由可配规则表判定，默认不触发）
 )
 
 func (k ErrKind) String() string {
@@ -42,6 +44,8 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrModelBlocked:
+		return "model_blocked"
 	default:
 		return "none"
 	}
@@ -49,9 +53,11 @@ func (k ErrKind) String() string {
 
 // Error 带分类的上游错误。
 type Error struct {
-	Kind   ErrKind
-	Status int
-	Msg    string
+	Kind       ErrKind
+	Status     int
+	Msg        string
+	RetryAfter time.Duration // 上游给的建议等待时长，0 = 未给
+	Model      string        // 请求的模型名（若有）
 }
 
 func (e *Error) Error() string {
@@ -104,6 +110,9 @@ type Client struct {
 	UgHost    string // https://api.trae.cn
 	OAuthHost string // https://api.trae.com.cn
 	ClientID  string // en1oxy7wnw8j9n
+
+	// modelRules 模型级错误规则（SetModelErrorRules 注入，默认空 = 永不触发）。
+	modelRules []ModelErrorRule
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -234,9 +243,64 @@ func normalizeExpiresAt(v int64) int64 {
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify）、err 为 nil；
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
-	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
+	return c.ChatStreamContext(context.Background(), a, body)
+}
+
+// ChatStreamDetailed 同 ChatStream，但 status>=400 时额外返回带 Kind/Status/
+// Model/RetryAfter 的 *Error（同时仍返回 rc=nil、respBody）。err 只在传输层失败时非 nil。
+// 保留 ChatStream 旧行为：旧调用方仍可自行 Classify(respBody)。
+func (c *Client) ChatStreamDetailed(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, uerr *Error, err error) {
+	rc, status, respBody, retryAfter, err := c.chatStream(ctx, a, body)
+	if err != nil || status < 400 {
+		return rc, status, respBody, nil, err
+	}
+	uerr = &Error{
+		Kind:       Classify(status, string(respBody)),
+		Status:     status,
+		Msg:        truncate(string(respBody), 500),
+		Model:      ModelFromBody(body),
+		RetryAfter: retryAfter,
+	}
+	// 模型级规则优先（规则表为空时永不命中）。
+	if kind, ok := c.MatchModelError(status, string(respBody)); ok {
+		uerr.Kind = ErrModelBlocked
+		if kind != "" {
+			uerr.Msg = kind + ": " + uerr.Msg
+		}
+	}
+	return rc, status, respBody, uerr, nil
+}
+
+// ModelFromBody 从请求体解析模型名：优先 config_name，回退 model。
+func ModelFromBody(body []byte) string {
+	var m struct {
+		ConfigName string `json:"config_name"`
+		Model      string `json:"model"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		return ""
+	}
+	if m.ConfigName != "" {
+		return m.ConfigName
+	}
+	return m.Model
+}
+
+// ChatStreamContext 带 ctx 的 llm_utils_chat 请求；ctx 取消（客户端断开）时
+// 传输层返回 context.Canceled，调用方可用 IsClientGone 判定。
+func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	rc, status, respBody, _, err = c.chatStream(ctx, a, body)
+	return rc, status, respBody, err
+}
+
+// chatStream 内部实现，额外返回上游 Retry-After 建议时长。
+func (c *Client) chatStream(ctx context.Context, a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, retryAfter time.Duration, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, nil, 0, err
 	}
 	SOLOHeaders(req, a, true)
 	// 用专用流客户端（无总超时），避免长 SSE 流被 HTTP.Timeout 截断。
@@ -247,17 +311,18 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	resp, err := hc.Do(req)
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
-		return nil, 0, nil, err
+		return nil, 0, nil, 0, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		kind := Classify(resp.StatusCode, string(raw))
+		retryAfter = ParseRetryAfter(resp.Header, time.Now())
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
-		return nil, resp.StatusCode, raw, nil
+		return nil, resp.StatusCode, raw, retryAfter, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	return resp.Body, resp.StatusCode, nil, 0, nil
 }
 
 // ModelInfo 动态模型信息。
@@ -397,6 +462,33 @@ func (c *Client) EntUsage(a *auth.Auth) (remain, limit, used int64, packs int, e
 		packs++
 	}
 	return remain, limit, used, packs, nil
+}
+
+// ConsumedCredits 读账号级「已消耗积分」累计值（usage_summary.consumed_amount）。
+//
+// 注意：这是**账号级累计计数器**，没有按请求拆分，因此只能靠前后差值估算单次
+// 请求消耗（见 internal/usage/sampler.go）。另外它聚合的是 entitlement 额度包
+// （含 work_credits），不等于 SOLO 通道可用的 ide_credits —— 用于成本估算没问题，
+// 用于「剩余额度」判断则不准（详见 docs/RESEARCH.md §3）。
+func (c *Client) ConsumedCredits(a *auth.Auth) (float64, bool) {
+	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return 0, false
+	}
+	UgHeaders(req, a)
+	data, err := c.doJSON(req)
+	if err != nil {
+		return 0, false
+	}
+	var resp struct {
+		UsageSummary struct {
+			Consumed float64 `json:"consumed_amount"`
+		} `json:"usage_summary"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return 0, false
+	}
+	return resp.UsageSummary.Consumed, true
 }
 
 // GetUserInfo 查询账号信息（登录用）。

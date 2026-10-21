@@ -1,4 +1,4 @@
-﻿// main.go trae2api-web 入口：加载配置 → 构建 pool → 起 HTTP 服务。
+// main.go trae2api-web 入口：加载配置 → 构建 pool/session/reqlog → 起 HTTP 服务。
 package main
 
 import (
@@ -13,9 +13,12 @@ import (
 
 	"trae2api-web/internal/auth"
 	"trae2api-web/internal/pool"
+	"trae2api-web/internal/reqlog"
 	"trae2api-web/internal/scheduler"
 	"trae2api-web/internal/server"
+	"trae2api-web/internal/session"
 	"trae2api-web/internal/upstream"
+	"trae2api-web/internal/usage"
 )
 
 func main() {
@@ -34,7 +37,18 @@ func main() {
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
 	p := pool.New(cfg.StateFile)
-	p.SyncToDir(auths) // 对齐：剔除 state.json 中已删除 auth 文件的幽灵账号
+	p.SetLimits(pool.Limits{
+		MaxInFlight:   cfg.Pool.MaxInFlight,
+		SoftRateBase:  cfg.SoftRateDur,
+		SoftRateMax:   cfg.SoftRateMaxDur,
+		BreakerThresh: cfg.Pool.BreakerThreshold,
+		BreakerBase:   cfg.BreakerDur,
+		BreakerMax:    cfg.BreakerMaxDur,
+		DegradeThresh: cfg.Pool.DegradeThreshold,
+		DegradeWindow: cfg.DegradeWindowDur,
+	})
+	// 对齐：剔除 state.json 中已删除 auth 文件的幽灵账号
+	p.SyncToDir(auths)
 
 	up := upstream.New()
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
@@ -42,25 +56,84 @@ func main() {
 	if tr, ok := up.StreamHTTP.Transport.(*http.Transport); ok {
 		tr.ResponseHeaderTimeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	}
+	// 模型级错误规则（默认空 = 永不触发）。抓到真实报文后在 config.json 的
+	// upstream.model_error_rules 里加规则即可，无需改代码。
+	if rules := cfg.modelErrorRules(); len(rules) > 0 {
+		up.SetModelErrorRules(rules)
+		log.Printf("loaded %d model error rule(s)", len(rules))
+	}
+
+	// 会话粘性路由（可用性判定直接接 pool）。
+	var sess *session.Router
+	if cfg.Session.Enabled {
+		sess = session.New(session.Config{
+			TTL:               cfg.SessionTTL,
+			GCInterval:        cfg.SessionGCDuration,
+			Available:         p.AvailableUIDs,
+			AvailableForModel: p.AvailableForModel,
+			CanRoute:          func(model, uid string) bool { return p.UIDAvailableForModel(uid, model) },
+		})
+		sess.StartGC()
+		defer sess.StopGC()
+	}
+
+	// 请求流水（内存 + 可选 JSONL 归档）。
+	rl := reqlog.New(reqlog.Config{
+		Dir:          cfg.ReqLog.Dir,
+		Enabled:      cfg.ReqLog.Enabled,
+		FileMaxBytes: int64(cfg.ReqLog.FileMaxMB) << 20,
+		RetainDays:   cfg.ReqLog.RetainDays,
+	})
+	defer rl.Close()
 
 	sch := scheduler.New(scheduler.Config{
 		Pool:         p,
 		Upstream:     up,
 		CheckinHour:  cfg.Schedule.CheckinHour,
 		RefreshHours: cfg.Schedule.RefreshHours,
+		BalanceHours: cfg.Schedule.BalanceHours,
 		RefreshSkew:  24 * time.Hour,
 	})
 
+	// 用量统计（按模型累计 token/缓存；积分靠采样估算）。
+	var usageTracker *usage.Tracker
+	var creditSampler *usage.Sampler
+	if cfg.Usage.Enabled {
+		usageTracker = usage.New(cfg.Usage.File, cfg.CreditSamplingDur)
+		defer usageTracker.Close()
+		// 积分采样需要读账号级累计计数器；采样器自己保证只在
+		// 「该账号仅本请求在途」时采信差值。
+		if cfg.CreditSamplingDur > 0 {
+			creditSampler = usage.NewSampler(
+				func(uid string) (float64, bool) {
+					a := p.AuthByUID(uid)
+					if a == nil {
+						return 0, false
+					}
+					return up.ConsumedCredits(a)
+				},
+				cfg.CreditSamplingDur,
+			)
+		}
+		log.Printf("usage stats enabled (file=%s, credit_sampling=%s)", cfg.Usage.File, cfg.CreditSamplingDur)
+	}
+
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		AuthDir:      cfg.AuthDir,
-		PlanCooldown: cfg.PlanCreditDur,
-		SoftCooldown: cfg.SoftRateDur,
-		ErrThreshold: cfg.Cooldown.ErrThresh,
-		ErrCooldown:  cfg.ErrCooldownDur,
-		DefaultModel: cfg.DefaultModel,
+		Pool:          p,
+		Upstream:      up,
+		APIKey:        cfg.APIKey,
+		AuthDir:       cfg.AuthDir,
+		PlanCooldown:  cfg.PlanCreditDur,
+		SoftCooldown:  cfg.SoftRateDur,
+		ErrThreshold:  cfg.Pool.BreakerThreshold,
+		ErrCooldown:   cfg.ErrCooldownDur,
+		DefaultModel:  cfg.DefaultModel,
+		RefreshSkew:   24 * time.Hour,
+		Session:       sess,
+		RequestLog:    rl,
+		Usage:         usageTracker,
+		CreditSampler: creditSampler,
+		ConfigPath:    *cfgPath,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -108,5 +181,7 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
+	// 停机：把 pool 内存状态刷盘，避免丢冷却/额度。
+	p.Flush()
 	log.Printf("bye")
 }

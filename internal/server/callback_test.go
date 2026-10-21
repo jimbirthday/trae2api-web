@@ -154,7 +154,7 @@ func TestExpireAtFromExchange(t *testing.T) {
 func TestBuildLoginURL(t *testing.T) {
 	machineID := "abcdef0123456789abcdef0123456789"
 	deviceID := "0123456789abcdef0123456789abcdef"
-	cb := "http://127.0.0.1:7864/authorize"
+	cb := "http://127.0.0.1:8000/authorize"
 
 	u := BuildLoginURL(machineID, deviceID, cb)
 	if !strings.HasPrefix(u, "https://www.trae.cn/authorization?") {
@@ -167,16 +167,16 @@ func TestBuildLoginURL(t *testing.T) {
 	q := parsed.Query()
 	// 核心参数齐全
 	checks := map[string]string{
-		"client_id":        "en1oxy7wnw8j9n",
-		"auth_from":        "solo",
-		"login_channel":    "native_ide",
-		"auth_type":        "local",
-		"machine_id":       machineID,
-		"device_id":        deviceID,
-		"x_machine_id":     machineID,
-		"x_device_id":      deviceID,
-		"x_device_brand":   "PC",
-		"x_device_type":    "PC",
+		"client_id":         "en1oxy7wnw8j9n",
+		"auth_from":         "solo",
+		"login_channel":     "native_ide",
+		"auth_type":         "local",
+		"machine_id":        machineID,
+		"device_id":         deviceID,
+		"x_machine_id":      machineID,
+		"x_device_id":       deviceID,
+		"x_device_brand":    "PC",
+		"x_device_type":     "PC",
 		"auth_callback_url": cb,
 	}
 	for k, want := range checks {

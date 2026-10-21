@@ -1,137 +1,121 @@
-﻿// Package pool 账号池：内存索引 + 冷却/禁用状态机 + state.json 持久化。
-// 挑选策略：healthy 账号中剩余积分最多者（SPEC §4.7）。
+// Package pool 账号池：单一状态机（健康/冷却/熔断/连败降权）+ 在途租约
+// + 加权挑选 + state.json 持久化。
+//
+// 分层：
+//   - pool.go      结构体、构造、账号增删、在途租约
+//   - entry.go     条目/对外状态类型与健康判定
+//   - limits.go    调优参数与默认值
+//   - pick.go      候选快照、权重、Top5 加权随机、可用性查询
+//   - cooldown.go  冷却/熔断/模型级冷却
+//   - degrade.go   连败降权
+//   - state.go     开关/暂停/禁用/额度/用量等状态迁移
+//   - persist.go   state.json 原子落盘与后台 flusher
+//
+// 依赖只允许 internal/auth 与 internal/logfmt；不依赖 upstream。
 package pool
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
-	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"trae2api-web/internal/auth"
 )
-
-// CoolKind 冷却类型。
-type CoolKind int
-
-const (
-	CoolPlan CoolKind = iota // 1005 plan 权益不足 → 12h 长冷却
-	CoolSoft                 // 429/404 → 60s 短冷却（404 不累计 errCount）
-	CoolErr                  // 连续错误 → 10m 中冷却
-)
-
-func (k CoolKind) String() string {
-	switch k {
-	case CoolPlan:
-		return "plan_limit"
-	case CoolSoft:
-		return "soft_rate"
-	case CoolErr:
-		return "error_threshold"
-	}
-	return "unknown"
-}
-
-// Status 单个账号对外暴露的状态（脱敏，不含 token）。
-type Status struct {
-	UID      string    `json:"uid"`
-	Nickname string    `json:"nickname,omitempty"`
-	Credits  int64     `json:"credits"`
-	Cooling  bool      `json:"cooling"`
-	Until    time.Time `json:"until,omitempty"`
-	Reason   string    `json:"reason,omitempty"`
-	// Disabled = session 失效硬禁用（需重登或换文件恢复）；Enabled = 软开关（用户可逆启停）。
-	// 对外暴露：Disabled 与 Enabled 都为 false 才算可被 Pick（healthy）。
-	Disabled bool `json:"disabled"`
-	Enabled  bool `json:"enabled"`
-	ErrCount int   `json:"err_count,omitempty"`
-}
-
-type entry struct {
-	a        *auth.Auth
-	credits  int64
-	disabled bool // session dead 硬禁用
-	enabled  bool // 用户软开关（默认 true），false 时 Pick 跳过
-	reason   string
-	until    time.Time
-	errCount int
-}
-
-func (e *entry) healthy(now time.Time) bool {
-	if e.disabled || !e.enabled {
-		return false
-	}
-	if !e.until.IsZero() && now.Before(e.until) {
-		return false
-	}
-	return true
-}
-
-// stateEntry state.json 单账号持久化条目。
-type stateEntry struct {
-	Credits  int64     `json:"credits"`
-	Disabled bool     `json:"disabled"`
-	Enabled  *bool     `json:"enabled,omitempty"` // 指针：旧文件缺省时按 true 处理，不写回脏值
-	Reason   string    `json:"reason,omitempty"`
-	Until    time.Time `json:"until,omitempty"`
-}
-
-// stateFile 持久化格式。
-type stateFile struct {
-	Accounts map[string]stateEntry `json:"accounts"`
-}
 
 // Pool 账号池。
 type Pool struct {
 	mu      sync.RWMutex
 	byUID   map[string]*entry
 	stateFp string
+
+	limits Limits
+	// maxInFlight 是 limits.MaxInFlight 的 atomic 副本：Acquire 热路径不取 p.mu。
+	maxInFlight atomic.Int32
+
+	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
+	randInt64N func(n int64) int64
+
+	// mutSeq 由持 p.mu 的写路径自增，标记「内存状态版本」；
+	// dirtySeq / writtenSeq 让落盘可丢弃「更晚采集、更早落盘」的乱序覆盖。
+	mutSeq     uint64
+	dirtySeq   atomic.Uint64
+	writtenSeq atomic.Uint64
+
+	// saveMu 串行化 state.json 落盘（tmp 写入 + rename 全在锁外做）。
+	// 不得与 p.mu 形成嵌套：saveMu 只包住写盘本身。
+	saveMu sync.Mutex
+
+	stopFlusher chan struct{}
+	flusherDone chan struct{}
+	stopOnce    sync.Once
 }
 
-// New 构建池；stateFp 非空时尝试加载旧状态。
+// New 构建池；stateFp 非空时尝试加载旧状态并启动后台 flusher。
 func New(stateFp string) *Pool {
-	p := &Pool{byUID: map[string]*entry{}, stateFp: stateFp}
+	p := &Pool{
+		byUID:   map[string]*entry{},
+		stateFp: stateFp,
+		limits:  defaultLimits(),
+	}
+	p.maxInFlight.Store(int32(p.limits.MaxInFlight))
 	if stateFp != "" {
 		p.load()
+		p.startFlusher()
 	}
 	return p
 }
 
-// Add 加入账号；已存在则保留原状态、更新凭证。
+// SetLimits 覆盖调优参数；零值字段回落默认值。
+func (p *Pool) SetLimits(l Limits) {
+	l = normalizeLimits(l)
+	p.mu.Lock()
+	p.limits = l
+	p.mutSeq++
+	p.mu.Unlock()
+	p.maxInFlight.Store(int32(l.MaxInFlight))
+}
+
+// Add 加入账号；已存在则保留原运行状态（credits/冷却/开关），只更新凭证。
 func (p *Pool) Add(a *auth.Auth) {
+	if a == nil || a.UID == "" {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[a.UID]; ok {
-		e.a = a // 保留 credits/cooling/enabled 状态
+		e.a = a
+		p.markDirtyLocked()
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a, enabled: true}
+	p.byUID[a.UID] = newEntry(a)
+	p.markDirtyLocked()
 }
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	seen := map[string]bool{}
+	seen := make(map[string]bool, len(auths))
 	for _, a := range auths {
+		if a == nil || a.UID == "" {
+			continue
+		}
 		seen[a.UID] = true
 		if e, ok := p.byUID[a.UID]; ok {
 			e.a = a
-		} else {
-			p.byUID[a.UID] = &entry{a: a, enabled: true}
+			continue
 		}
+		p.byUID[a.UID] = newEntry(a)
 	}
 	for uid := range p.byUID {
 		if !seen[uid] {
 			delete(p.byUID, uid)
 		}
 	}
+	p.markDirtyLocked()
 }
 
-// Remove 删除账号（仅清内存索引与 state.json 条目；auths/trae-{uid}.json 由调用方删）。
-// 不存在返回 false，调用方据此决定 404。
+// Remove 删除账号（仅内存索引与 state.json 条目；凭证文件由调用方删）。
 func (p *Pool) Remove(uid string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -139,243 +123,97 @@ func (p *Pool) Remove(uid string) bool {
 		return false
 	}
 	delete(p.byUID, uid)
-	p.saveLocked()
+	p.markDirtyLocked()
 	return true
 }
 
-// SetEnabled 切换账号软开关；不影响 disabled（session dead）状态。
-// reason 仅在关闭时记录。不存在返回 false。
-func (p *Pool) SetEnabled(uid string, enabled bool, reason string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
+// entryOf 取条目指针（短读锁）。
+func (p *Pool) entryOf(uid string) *entry {
+	p.mu.RLock()
+	e := p.byUID[uid]
+	p.mu.RUnlock()
+	return e
+}
+
+// ---------------------------------------------------------------------------
+// 在途租约
+// ---------------------------------------------------------------------------
+
+// Acquire 抢占一个在途名额：CAS 自增，满/不存在返回 false。
+// MaxInFlight<=0 时恒 true（租约关闭）。
+func (p *Pool) Acquire(uid string) bool {
+	e := p.entryOf(uid)
+	if e == nil {
 		return false
 	}
-	e.enabled = enabled
-	if !enabled && reason != "" {
-		e.reason = reason
+	limit := int(p.maxInFlight.Load())
+	if limit <= 0 {
+		return true
 	}
-	if enabled {
-		// 重新启用时清掉软关闭的 reason；disabled/cooling 不动
-		if e.reason != "" && !e.disabled && e.until.IsZero() {
-			e.reason = ""
+	for {
+		cur := e.inFlight.Load()
+		if cur >= int32(limit) {
+			return false
+		}
+		if e.inFlight.CompareAndSwap(cur, cur+1) {
+			return true
 		}
 	}
-	p.saveLocked()
-	return true
 }
 
-// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
-func (p *Pool) Pick() *auth.Auth {
-	return p.PickExcluding(nil)
-}
-
-// PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
-func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	var best *entry
-	for uid, e := range p.byUID {
-		if tried != nil && tried[uid] {
-			continue
-		}
-		if !e.healthy(now) {
-			continue
-		}
-		if best == nil || e.credits > best.credits {
-			best = e
-		}
-	}
-	if best == nil {
-		return nil
-	}
-	return best.a
-}
-
-// SetCredits 更新账号积分。
-func (p *Pool) SetCredits(uid string, credits int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.credits = credits
-	}
-	p.saveLocked()
-}
-
-// Cooldown 冷却账号至 now+d。
-func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.until = time.Now().Add(d)
-		e.reason = reason
-		e.errCount = 0
-	}
-	p.saveLocked()
-}
-
-// Disable 永久禁用（session 失效），需人工重登后手工恢复或文件替换。
-func (p *Pool) Disable(uid, reason string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.disabled = true
-		e.reason = reason
-	}
-	p.saveLocked()
-}
-
-// ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号处于冷却（非禁用）时恢复。
-func (p *Pool) ReenableIfCredits(uid string, remain int64) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.credits = remain
-		if remain > 0 && !e.disabled {
-			e.until = time.Time{}
-			e.reason = ""
-			e.errCount = 0
-		}
-	}
-	p.saveLocked()
-}
-
-// NoteError 记录一次错误；达到 threshold 自动冷却 d 时长。
-func (p *Pool) NoteError(uid string, threshold int, d time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.errCount++
-		if e.errCount >= threshold {
-			e.until = time.Now().Add(d)
-			e.reason = "consecutive errors"
-			e.errCount = 0
-		}
-	}
-	p.saveLocked()
-}
-
-// NoteSuccess 成功请求重置错误计数。
-func (p *Pool) NoteSuccess(uid string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if e, ok := p.byUID[uid]; ok {
-		e.errCount = 0
-	}
-}
-
-// Status 查询单账号状态。
-func (p *Pool) Status(uid string) (Status, bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return Status{}, false
-	}
-	return p.statusOf(uid, e), true
-}
-
-// AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
-func (p *Pool) AuthByUID(uid string) *auth.Auth {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if e, ok := p.byUID[uid]; ok {
-		return e.a
-	}
-	return nil
-}
-
-// List 返回所有账号状态（按 UID 排序，稳定输出）。
-func (p *Pool) List() []Status {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	uids := make([]string, 0, len(p.byUID))
-	for uid := range p.byUID {
-		uids = append(uids, uid)
-	}
-	sort.Strings(uids)
-	out := make([]Status, 0, len(uids))
-	for _, uid := range uids {
-		out = append(out, p.statusOf(uid, p.byUID[uid]))
-	}
-	return out
-}
-
-func (p *Pool) statusOf(uid string, e *entry) Status {
-	now := time.Now()
-	return Status{
-		UID:      uid,
-		Nickname: e.a.Nickname,
-		Credits:  e.credits,
-		Cooling:  !e.until.IsZero() && now.Before(e.until),
-		Until:    e.until,
-		Reason:   e.reason,
-		Disabled: e.disabled,
-		Enabled:  e.enabled,
-		ErrCount: e.errCount,
-	}
-}
-
-// ---------------------------------------------------------------------------
-// 持久化
-// ---------------------------------------------------------------------------
-
-func (p *Pool) load() {
-	raw, err := os.ReadFile(p.stateFp)
-	if err != nil {
+// Release 归还一个在途名额：CAS 自减并 clamp 到 0（重复调用安全）。
+func (p *Pool) Release(uid string) {
+	e := p.entryOf(uid)
+	if e == nil {
 		return
 	}
-	var sf stateFile
-	if json.Unmarshal(raw, &sf) != nil {
-		return
-	}
-	for uid, s := range sf.Accounts {
-		enabled := true // 旧文件无 enabled 字段 → 默认启用，向后兼容
-		if s.Enabled != nil {
-			enabled = *s.Enabled
+	for {
+		cur := e.inFlight.Load()
+		if cur <= 0 {
+			return
 		}
-		p.byUID[uid] = &entry{
-			a:        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:  s.Credits,
-			disabled: s.Disabled,
-			enabled:  enabled,
-			reason:   s.Reason,
-			until:    s.Until,
+		if e.inFlight.CompareAndSwap(cur, cur-1) {
+			return
 		}
 	}
 }
 
-func (p *Pool) saveLocked() {
-	if p.stateFp == "" {
-		return
+// InFlight 返回当前在途数。
+func (p *Pool) InFlight(uid string) int {
+	e := p.entryOf(uid)
+	if e == nil {
+		return 0
 	}
-	sf := stateFile{Accounts: map[string]stateEntry{}}
-	for uid, e := range p.byUID {
-		se := stateEntry{
-			Credits:  e.credits,
-			Disabled: e.disabled,
-			Reason:   e.reason,
-			Until:    e.until,
-		}
-		// 仅在软关闭时写 enabled=false；默认 true 用 omitempty 省略，旧版本读为 true。
-		if !e.enabled {
-			f := false
-			se.Enabled = &f
-		}
-		sf.Accounts[uid] = se
-	}
-	raw, err := json.MarshalIndent(sf, "", "  ")
-	if err != nil {
-		return
-	}
-	if dir := filepath.Dir(p.stateFp); dir != "" && dir != "." {
-		_ = os.MkdirAll(dir, 0o755)
-	}
-	tmp := p.stateFp + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return
-	}
-	_ = os.Rename(tmp, p.stateFp)
+	return int(e.inFlight.Load())
 }
+
+// inFlightFull 报告某条目是否已达在途上限（调用方需持 p.mu 或已取快照）。
+func (p *Pool) inFlightFull(e *entry) bool {
+	limit := int(p.maxInFlight.Load())
+	if limit <= 0 {
+		return false
+	}
+	return int(e.inFlight.Load()) >= limit
+}
+
+// closeFlusher 停掉后台 flusher 并等待其退出（测试/进程退出用）。
+func (p *Pool) closeFlusher() {
+	p.stopOnce.Do(func() {
+		if p.stopFlusher == nil {
+			return
+		}
+		close(p.stopFlusher)
+		<-p.flusherDone
+	})
+}
+
+// markDirtyLocked 标记有变更待落盘（调用方持 p.mu 写锁）。
+func (p *Pool) markDirtyLocked() {
+	p.mutSeq++
+	p.dirtySeq.Store(p.mutSeq)
+}
+
+func nowFunc() time.Time { return time.Now() }
+
+// MaxInFlight 返回单账号在途上限（<=0 = 不限）。
+func (p *Pool) MaxInFlight() int { return int(p.maxInFlight.Load()) }
