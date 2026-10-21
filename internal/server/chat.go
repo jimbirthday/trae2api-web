@@ -108,6 +108,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	lastRateLimited := false
 	rotates := 0
+
+	// 流式响应的 SSE 写入器：**惰性创建**，但在连上游之前就创建好。
+	//
+	// 为什么要提前开流：从拿到账号到上游吐出第一个字节，中间有 token 预刷新 +
+	// 建连 + 上游排队 + 首包生成，实测 0.8~10s。若等上游握手完成才写响应头，
+	// 客户端这段时间收不到任何字节，看起来就是「点了没反应」。提前开流后
+	// 客户端几毫秒内就能拿到 200 + SSE 头 + role 帧，等待期由心跳保活。
+	sseModel := providerName(peek.Model, configName)
+	var sse *upstream.SSEWriter
+	openStream := func() {
+		if sse != nil {
+			return
+		}
+		sse = upstream.NewSSEWriter(w, sseModel)
+		sse.StartHeartbeat(h.cfg.StreamHeartbeat)
+	}
+	defer func() {
+		if sse != nil {
+			sse.Close()
+		}
+	}()
+
 	for rotates < h.cfg.MaxRotate {
 		var acct *auth.Auth
 		if stickyUID != "" {
@@ -144,6 +166,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rotates++
 			rec.Rotates = rotates
 			continue
+		}
+
+		// token 预刷新可能耗时数百毫秒，上游首包更久 —— 先把流开出去。
+		if peek.Stream {
+			openStream()
 		}
 
 		// token 临近过期 → 先刷新（失败则冷却换号）。
@@ -230,15 +257,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			bindSticky()
 			h.cfg.Pool.NoteSuccess(acct.UID)
 			rec.Status = http.StatusOK
-			err := upstream.StreamWithHooks(w, rc,
-				func(se *upstream.SOLOStreamError) {
+			openStream() // 理论上已开；防御性兜底
+			err := sse.Run(rc, upstream.StreamOptions{
+				// 把请求的模型名写进每个 chunk：上游 metadata 的 model 常为空，
+				// 留空会让客户端无法按模型统计/显示。
+				Model: sseModel,
+				// 思考期给客户端看什么（上游思考可达数千字/数十秒）。
+				Thinking: h.cfg.StreamThinking,
+				OnError: func(se *upstream.SOLOStreamError) {
 					h.handleStreamError(acct.UID, configName, se)
 				},
-				func(d upstream.UsageDetail) {
+				OnUsage: func(d upstream.UsageDetail) {
 					// 流式 usage 记账：与非流式保持对称（含缓存/思考链/延迟）。
 					h.recordUsageDetail(acct.UID, configName, d, time.Since(started), rec)
 					h.noteCreditCompletion(acct.UID, configName, d.TotalTokens)
-				})
+				},
+			})
 			rc.Close()
 			h.cfg.Pool.Release(acct.UID)
 			switch {
@@ -316,6 +350,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	rec.Outcome = reqlog.OutcomeHTTPError
 	rec.Status = http.StatusServiceUnavailable
 	rec.Error = msg
+	// 流已经开出去（响应头 200 已发），状态码改不动了：用流内 error 事件
+	// 收尾，客户端才会立刻报错而不是一直挂着等 token。
+	if sse != nil {
+		rec.Outcome = reqlog.OutcomeStreamError
+		sse.WriteError(msg)
+		return
+	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
 
@@ -412,4 +453,15 @@ func sanitizeErrMsg(s string) string {
 		s = logfmt.Truncate(s, 300)
 	}
 	return s
+}
+
+// providerName 决定写进 SSE chunk 的 model 字段：
+// 优先回显客户端请求的模型名（客户端按它做路由/统计），
+// 客户端没传（"auto"/空）时回落到实际使用过的 config_name。
+func providerName(requested, resolved string) string {
+	requested = strings.TrimSpace(requested)
+	if requested == "" || strings.EqualFold(requested, "auto") {
+		return resolved
+	}
+	return requested
 }

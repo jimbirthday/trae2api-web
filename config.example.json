@@ -20,6 +20,10 @@
     "degrade_window": "10m",
     "credit_floor": 0
   },
+  "stream": {
+    "thinking": "content",
+    "heartbeat": "1s"
+  },
   "usage": {
     "enabled": true,
     "file": "./data/usage.json",

@@ -30,6 +30,11 @@ type Config struct {
 	ErrCooldown  time.Duration // 错误冷却，默认 10m
 	RefreshSkew  time.Duration // token 预刷新窗口，默认 24h
 	DefaultModel string        // 默认 glm-5.2
+	// StreamThinking 思考内容呈现方式（上游会先思考几十秒才给正文，
+	// 这里决定这段时间给客户端看什么）。零值 = reasoning_content。
+	StreamThinking upstream.ThinkingMode
+	// StreamHeartbeat 空闲保活间隔；0 = 关闭心跳。
+	StreamHeartbeat time.Duration
 
 	// Session 会话粘性路由（nil = 关闭粘性，每次请求独立选号）。
 	Session *session.Router

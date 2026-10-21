@@ -30,19 +30,23 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
 // SOLOEvent 单条 SOLO SSE 事件（归一化）。
 type SOLOEvent struct {
-	Event        string          // metadata | timing_cost | output | extra_info | token_usage | done | error
-	Response     string          // output: content 增量
-	Reasoning    string          // output: 思考链增量
+	Event        string          // metadata | timing_cost | output | extra_info | plan_item | progress_notice | token_usage | done | error | heartbeat
+	Response     string          // output/plan_item: content 增量
+	Reasoning    string          // output/plan_item: 思考链增量
 	ToolCalls    json.RawMessage // output: 工具调用（null 或对象/数组）
 	Usage        map[string]any  // token_usage
 	FinishReason string          // done
 	ErrorCode    int64           // error
 	ErrorMessage string          // error
+	// ModelName 上游在部分事件里回报的真实模型名（metadata/extra_info.model）。
+	// 用于把 chunk 的 model 字段填对，而不是留空字符串。
+	ModelName string
 }
 
 // SOLOStreamError 上游 SSE 流内的业务错误（event:error）。非流式聚合时返回，
@@ -85,6 +89,9 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 	if err := json.Unmarshal([]byte(dataLine), &raw); err != nil {
 		return nil, err
 	}
+	if v, ok := raw["model"].(string); ok && v != "" {
+		ev.ModelName = v
+	}
 	switch ev.Event {
 	case "output":
 		if v, ok := raw["response"].(string); ok {
@@ -96,6 +103,19 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 		if tc, ok := raw["tool_calls"]; ok {
 			ev.ToolCalls, _ = json.Marshal(tc)
 		}
+	case "plan_item":
+		// 新版上游把「思考/计划」拆到 plan_item：thought / reasoning_content / content。
+		// 只取思考面，正文由 output 事件给，避免 content 双写。
+		if v, ok := raw["reasoning_content"].(string); ok {
+			ev.Reasoning = v
+		} else if v, ok := raw["thought"].(string); ok {
+			ev.Reasoning = v
+		}
+		if v, ok := raw["tool_calls"]; ok {
+			ev.ToolCalls, _ = json.Marshal(v)
+		}
+	case "heartbeat", "keepalive", "ping", "progress_notice", "request_wait_in_queue":
+		// 心跳/队列提示：不产生正文，只用于下游保活（见 streamHooks）。
 	case "token_usage":
 		ev.Usage = raw
 	case "done":
@@ -155,8 +175,9 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id           string
-		content      strings.Builder
-		reasoning    strings.Builder
+		modelName    string
+		content      textAcc
+		reasoning    textAcc
 		finishReason = "stop"
 		usage        map[string]any
 		toolCalls    = map[int]map[string]any{}
@@ -170,14 +191,18 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			return nil, err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
+			if ev.ModelName != "" {
+				modelName = ev.ModelName
+			}
 			switch ev.Event {
 			case "metadata":
 				if id == "" && ev.Usage != nil {
 					// metadata 无 id 可用，保留为空，末尾补 chatcmpl。
 				}
-			case "output":
-				content.WriteString(ev.Response)
-				reasoning.WriteString(ev.Reasoning)
+			case "output", "plan_item":
+				// 与非流式一致：上游可能发增量也可能发累计快照，由 textAcc 统一判定。
+				content.add(ev.Response)
+				reasoning.add(ev.Reasoning)
 				mergeToolCallJSON(toolCalls, &toolOrder, ev.ToolCalls)
 			case "token_usage":
 				usage = ev.Usage
@@ -203,7 +228,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		"role":    "assistant",
 		"content": content.String(),
 	}
-	if reasoning.Len() > 0 {
+	if reasoning.String() != "" {
 		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolOrder) > 0 {
@@ -218,7 +243,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		"id":      id,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
-		"model":   "",
+		"model":   modelName,
 		"choices": []any{
 			map[string]any{
 				"index":         0,
@@ -313,151 +338,378 @@ func sortInts(a []int) {
 	}
 }
 
-// Stream 流式转换：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。
-// 调用方必须先设置过 status 200；本函数自设 SSE headers。
-func Stream(w http.ResponseWriter, r io.Reader) error {
-	return streamOpts(w, r, nil)
+// StreamOptions 流式输出的行为开关（零值 = 全部默认）。
+type StreamOptions struct {
+	// Model 写进每个 chunk 的 model 字段。上游 SOLO 的 metadata 里 model 常为空，
+	// 留空会让客户端无法按模型统计/路由，所以由调用方传入请求的模型名。
+	Model string
+	// OnError 上游 event:error 回调（冷却账号/记流水）。
+	OnError func(*SOLOStreamError)
+	// OnUsage 收到 token_usage 时回调（记账）。
+	OnUsage func(UsageDetail)
+	// Heartbeat 空闲保活间隔。上游静默超过该时长就写一行 SSE 注释，
+	// 让客户端/中间代理知道连接还活着。0 = 用 DefaultHeartbeat。
+	Heartbeat time.Duration
+	// Thinking 思考内容呈现方式（见 server 配置 stream.thinking）：
+	//   ThinkingReasoning（默认）→ delta.reasoning_content
+	//   ThinkingContent         → 包进 think 标签作为 delta.content
+	//   ThinkingNone            → 丢弃
+	Thinking ThinkingMode
 }
 
-// StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil），
-// 供调用方冷却账号/记录日志；错误信息同时注入 SSE 事件流。
-func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
-	return streamOpts(w, r, onErr)
-}
+// ThinkingMode 思考内容的呈现方式。
+type ThinkingMode int
 
-// StreamWithHooks 同 StreamWithError，额外在收到 token_usage 事件时回调 onUsage。
+const (
+	// ThinkingReasoning 走 delta.reasoning_content（DeepSeek 约定，主流客户端会渲染成思考过程）。
+	ThinkingReasoning ThinkingMode = iota
+	// ThinkingContent 把思考包进 think 标签后作为正文增量下发。
+	//
+	// 为什么需要这个模式：上游 SOLO 先思考几十秒才给正文（实测 glm-5.2 思考
+	// 2000~9000 字、正文首个字符晚 14~90s）。只渲染 delta.content 的客户端
+	// （Cline / Zed / 各类 CLI / 多数网页端）这段时间一片空白，用户观感就是
+	// 「卡住了」；trae-cn-relay 之类的实现默认就把压缩后的思考当正文输出，
+	// 所以看起来一直在出字。开启本模式即对齐该行为。
+	ThinkingContent
+	// ThinkingNone 丢弃思考，只下发正文。
+	ThinkingNone
+)
+
+// 思考块标记（与主流前端约定一致，Cherry Studio / OpenWebUI 等会折叠显示）。
+const (
+	thinkOpenTag  = " thinking\n\n"
+	thinkCloseTag = "\n\n<｜end▁of▁thinking｜>\n\n"
+)
+
+// DefaultHeartbeat 默认空闲保活间隔。
 //
-// 流式请求的 usage 只存在于 SSE 的 event:token_usage 里，不消费这个事件就永远
-// 记不到 token 账（非流式走 Aggregate 能拿到，所以两边会不对称）。
-// onUsage 收到的是完整用量（含 cache_read_input_tokens / reasoning_tokens）。
-func StreamWithHooks(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), onUsage func(UsageDetail)) error {
-	return streamHooks(w, r, onErr, onUsage)
+// 为什么必须有心跳：从「客户端发请求」到「上游吐出第一个字」之间，要经历
+// 建连 + 上游排队 + 首包生成，实测可长达数秒甚至 10s+。这段时间若一个字节
+// 都不写，客户端会以为连接卡死：部分 SDK 有首包空闲超时，中间代理
+// （Nginx proxy_read_timeout、Cloudflare 等）会直接掐断连接。
+const DefaultHeartbeat = 1 * time.Second
+
+// SSEWriter 是 OpenAI SSE 输出的独占写入器。
+//
+// 存在的意义：流式请求要「先开流、再连上游」——先立刻把 200 + SSE 头 + role 帧
+// 刷给客户端（约几毫秒），随后才去建上游连接。中间这段空隙由心跳协程持续写
+// SSE 注释行保活。若直接把 http.ResponseWriter 交给解析循环，就必须等上游
+// 握手完成才能写第一个字节，用户侧表现就是「点了没反应，过一两秒才突然开始」。
+//
+// 并发：所有写入都经 mu 串行化（心跳协程与解析循环会同时写）。
+type SSEWriter struct {
+	w  http.ResponseWriter
+	fl http.Flusher
+	mu sync.Mutex
+
+	id        string
+	created   int64
+	model     string
+	lastWrite time.Time
+	closed    bool
+
+	// 正文/思考累计器：识别上游的「累计快照」帧并只下发新增后缀。
+	contentSeen   textAcc
+	reasoningSeen textAcc
+
+	// thinking 模式与「思考块是否已开」状态（ThinkingContent 模式下维护）。
+	thinking    ThinkingMode
+	thinkOpened bool
+	thinkClosed bool
+
+	hbDone chan struct{}
+	hbWG   sync.WaitGroup
 }
 
-func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
-	return streamHooks(w, r, onErr, nil)
-}
-
-// streamHooks Stream 的完整可选参数版本。
-func streamHooks(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), onUsage func(UsageDetail)) error {
+// NewSSEWriter 设置 SSE 响应头、立刻 flush，并写入首个 role 帧。
+// 调用返回后客户端已经能看到一个已打开的空流。
+func NewSSEWriter(w http.ResponseWriter, model string) *SSEWriter {
 	h := w.Header()
-	h.Set("Content-Type", "text/event-stream")
-	h.Set("Cache-Control", "no-cache")
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache, no-transform")
 	h.Set("Connection", "keep-alive")
-	h.Set("X-Accel-Buffering", "no")
-	fl, _ := w.(http.Flusher)
+	h.Set("X-Accel-Buffering", "no") // 关 Nginx 缓冲，否则整段回复会攒到最后一次吐出
 
+	s := &SSEWriter{
+		w:        w,
+		fl:       asFlusher(w),
+		id:       fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+		created:  time.Now().Unix(),
+		model:    model,
+		thinking: ThinkingReasoning,
+	}
+	// 立刻把响应头刷下去：客户端从「等首字节」变成「等第一个字符」。
+	s.flushLocked()
+	// 首帧角色：Cline / Zed / Codex 等客户端依赖它开始渲染消息气泡。
+	s.writeChunk(map[string]any{"role": "assistant"}, "")
+	return s
+}
+
+func asFlusher(w http.ResponseWriter) http.Flusher {
+	if f, ok := w.(http.Flusher); ok {
+		return f
+	}
+	return nil
+}
+
+// Model 返回写入 chunk 的模型名。
+func (s *SSEWriter) Model() string { return s.model }
+
+// StartHeartbeat 启动空闲保活协程：只要 hb 内没有写出任何字节，就补一行注释。
+// 重复调用安全（第二次起直接忽略）。
+func (s *SSEWriter) StartHeartbeat(hb time.Duration) {
+	if s == nil {
+		return
+	}
+	if hb <= 0 {
+		hb = DefaultHeartbeat
+	}
+	s.mu.Lock()
+	if s.hbDone != nil || s.closed {
+		s.mu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	s.hbDone = done
+	s.mu.Unlock()
+
+	s.hbWG.Add(1)
+	go func() {
+		defer s.hbWG.Done()
+		t := time.NewTicker(hb)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				s.mu.Lock()
+				if !s.closed && time.Since(s.lastWrite) >= hb {
+					s.writeRawLocked(": keepalive\n\n")
+				}
+				s.mu.Unlock()
+			}
+		}
+	}()
+}
+
+// Close 停止心跳协程并等待其退出。可重复调用。
+func (s *SSEWriter) Close() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	s.closed = true
+	if s.hbDone != nil {
+		close(s.hbDone)
+		s.hbDone = nil
+	}
+	s.mu.Unlock()
+	s.hbWG.Wait()
+}
+
+// WriteError 在已开的流内报错（响应头已发 200，无法再改状态码）。
+// 同时发一条 OpenAI 风格的 error 事件与 [DONE]，客户端不会一直挂着。
+func (s *SSEWriter) WriteError(msg string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writeRawLocked("event: error\ndata: " + jsonEscape(msg) + "\n\n")
+	s.writeRawLocked("data: [DONE]\n\n")
+}
+
+func (s *SSEWriter) writeRawLocked(payload string) {
+	if _, err := io.WriteString(s.w, payload); err != nil {
+		return
+	}
+	s.lastWrite = time.Now()
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
+// flushLocked 只刷响应头（不写正文）。
+func (s *SSEWriter) flushLocked() {
+	s.lastWrite = time.Now()
+	if s.fl != nil {
+		s.fl.Flush()
+	}
+}
+
+func (s *SSEWriter) writeChunk(delta map[string]any, finish string) {
+	choice := map[string]any{"index": 0, "delta": delta}
+	if finish != "" {
+		choice["finish_reason"] = finish
+	} else {
+		choice["finish_reason"] = nil
+	}
+	chunk := map[string]any{
+		"id":      s.id,
+		"object":  "chat.completion.chunk",
+		"created": s.created,
+		"model":   s.model,
+		"choices": []any{choice},
+	}
+	raw, _ := json.Marshal(chunk)
+	s.writeRawLocked("data: " + string(raw) + "\n\n")
+}
+
+// WriteChunk 对外暴露的 chunk 写入（server 需要补发 usage 等场景）。
+func (s *SSEWriter) WriteChunk(delta map[string]any, finish string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.writeChunk(delta, finish)
+}
+
+// Run 消费上游 SOLO SSE 并转成 OpenAI chunk。
+// 与旧 Stream* 的区别：响应头与 role 帧已在 NewSSEWriter 写过，
+// 因此上游迟迟不吐数据时，心跳仍能生效。
+func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
+	if s.model == "" {
+		s.model = opts.Model
+	}
+	s.thinking = opts.Thinking
 	br := bufio.NewReaderSize(r, 64*1024)
-	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	var pendingUsage map[string]any
 	sawDone := false
 	st := &sseState{}
-	writeChunk := func(delta map[string]any, finish string) error {
-		chunk := map[string]any{
-			"id":      id,
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   "",
-			"choices": []any{
-				map[string]any{
-					"index": 0,
-					"delta": delta,
-				},
-			},
-		}
-		choice := chunk["choices"].([]any)[0].(map[string]any)
-		if finish != "" {
-			choice["finish_reason"] = finish
-		}
-		if pendingUsage != nil {
-			chunk["usage"] = pendingUsage
-			pendingUsage = nil
-		}
-		raw, _ := json.Marshal(chunk)
-		if _, err := io.WriteString(w, "data: "+string(raw)+"\n\n"); err != nil {
-			return err
-		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
+
+	type readResult struct {
+		line string
+		err  error
 	}
-	writeDONE := func() error {
-		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-			return err
+	lines := make(chan readResult, 64)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			line, err := br.ReadString('\n')
+			select {
+			case lines <- readResult{line, err}:
+			case <-stop:
+				return
+			}
+			if err != nil {
+				return
+			}
 		}
-		if fl != nil {
-			fl.Flush()
-		}
-		return nil
-	}
+	}()
 
 	for {
-		line, err := br.ReadString('\n')
+		var rr readResult
+		select {
+		case rr = <-lines:
+		case <-stop:
+			return nil
+		}
+		line, err := rr.line, rr.err
 		if err != nil && err != io.EOF {
 			return err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
 			switch ev.Event {
-			case "output":
-				delta := map[string]any{}
-				if ev.Response != "" {
-					delta["content"] = ev.Response
-				}
-				if ev.Reasoning != "" {
-					delta["reasoning_content"] = ev.Reasoning
-				}
-				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {
-					var tc []map[string]any
-					if err := json.Unmarshal(ev.ToolCalls, &tc); err == nil {
-						// SOLO 上游 tool_call 条目用 `function_call` 字段 → 转成 OpenAI 的 `function`
-						for _, call := range tc {
-							if fc, ok := call["function_call"].(map[string]any); ok {
-								call["function"] = fc
-								delete(call, "function_call")
-							}
-							// 清理 SOLO 专属字段,只保留标准 OpenAI function 结构(name/arguments)
-							if fn, ok := call["function"].(map[string]any); ok {
-								delete(fn, "namespace")
-								delete(fn, "partial_arguments")
-							}
+			case "output", "plan_item":
+				s.mu.Lock()
+				out := s.contentSeen.add(ev.Response)
+				think := s.reasoningSeen.add(ev.Reasoning)
+				switch s.thinking {
+				case ThinkingNone:
+					// 丢弃思考，只发正文。
+					if out != "" {
+						s.writeChunk(map[string]any{"content": out}, "")
+					}
+				case ThinkingContent:
+					// 思考当正文发：空档期立刻有字在动，观感就是「边想边说」。
+					// 用 think 标签包起来，支持折叠的客户端仍会收成「思考过程」。
+					var buf strings.Builder
+					if think != "" {
+						if !s.thinkOpened {
+							buf.WriteString(thinkOpenTag)
+							s.thinkOpened = true
 						}
-						delta["tool_calls"] = tc
+						buf.WriteString(think)
+					}
+					if out != "" {
+						if s.thinkOpened && !s.thinkClosed {
+							buf.WriteString(thinkCloseTag)
+							s.thinkClosed = true
+						}
+						buf.WriteString(out)
+					}
+					if buf.Len() > 0 {
+						s.writeChunk(map[string]any{"content": buf.String()}, "")
+					}
+				default: // ThinkingReasoning
+					delta := map[string]any{}
+					if out != "" {
+						delta["content"] = out
+					}
+					if think != "" {
+						delta["reasoning_content"] = think
+					}
+					if len(delta) > 0 {
+						s.writeChunk(delta, "")
 					}
 				}
-				if len(delta) > 0 {
-					if err := writeChunk(delta, ""); err != nil {
-						return err
+				s.mu.Unlock()
+				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {
+					if tc, ok := normalizeStreamToolCalls(ev.ToolCalls); ok {
+						s.WriteChunk(map[string]any{"tool_calls": tc}, "")
 					}
 				}
 			case "token_usage":
 				pendingUsage = ev.Usage
-				if onUsage != nil {
+				if opts.OnUsage != nil {
 					if d, ok := UsageDetailFromEvent(ev); ok {
-						onUsage(d)
+						opts.OnUsage(d)
 					}
 				}
+			case "heartbeat", "keepalive", "ping", "progress_notice", "request_wait_in_queue":
+				// 上游心跳/排队提示：转成下游保活注释，别让客户端以为断流。
+				s.mu.Lock()
+				s.writeRawLocked(": keepalive\n\n")
+				s.mu.Unlock()
 			case "done":
-				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
-					return err
+				s.mu.Lock()
+				if s.thinking == ThinkingContent && s.thinkOpened && !s.thinkClosed {
+					s.writeChunk(map[string]any{"content": thinkCloseTag}, "")
+					s.thinkClosed = true
 				}
-				if err := writeDONE(); err != nil {
-					return err
+				if pendingUsage != nil {
+					usageChunk := map[string]any{
+						"id":      s.id,
+						"object":  "chat.completion.chunk",
+						"created": s.created,
+						"model":   s.model,
+						"choices": []any{map[string]any{
+							"index": 0, "delta": map[string]any{}, "finish_reason": ev.FinishReason,
+						}},
+						"usage": pendingUsage,
+					}
+					raw, _ := json.Marshal(usageChunk)
+					s.writeRawLocked("data: " + string(raw) + "\n\n")
+					pendingUsage = nil
+				} else {
+					s.writeChunk(map[string]any{}, ev.FinishReason)
 				}
+				s.writeRawLocked("data: [DONE]\n\n")
+				s.mu.Unlock()
 				sawDone = true
 			case "error":
-				// 上游业务错误：回调 + 写一条 error 事件 + [DONE]。
 				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
-				if onErr != nil {
-					onErr(se)
+				if opts.OnError != nil {
+					opts.OnError(se)
 				}
-				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
-				if _, err := io.WriteString(w, "event: error\n"+"data: "+jsonEscape(msg)+"\n\n"); err != nil {
-					return err
-				}
-				if err := writeDONE(); err != nil {
-					return err
-				}
+				s.WriteError(fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage))
 				sawDone = true
 			}
 		}
@@ -466,10 +718,130 @@ func streamHooks(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError
 		}
 	}
 	if !sawDone {
-		// 幂等兜底：上游中断（无 done）仍写 [DONE]。
-		return writeDONE()
+		// 幂等兜底：上游中断（无 done）仍写 [DONE]，避免客户端一直等。
+		s.mu.Lock()
+		s.writeRawLocked("data: [DONE]\n\n")
+		s.mu.Unlock()
 	}
 	return nil
+}
+
+// Stream 流式转换：SOLO SSE → OpenAI SSE chunk，逐条 flush，保证至少一个 [DONE]。
+// 调用方必须先设置过 status 200；本函数自设 SSE headers。
+func Stream(w http.ResponseWriter, r io.Reader) error {
+	return StreamWithOptions(w, r, StreamOptions{})
+}
+
+// StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil），
+// 供调用方冷却账号/记录日志；错误信息同时注入 SSE 事件流。
+func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
+	return StreamWithOptions(w, r, StreamOptions{OnError: onErr})
+}
+
+// StreamWithHooks 同 StreamWithError，额外在收到 token_usage 事件时回调 onUsage。
+func StreamWithHooks(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError), onUsage func(UsageDetail)) error {
+	return StreamWithOptions(w, r, StreamOptions{OnError: onErr, OnUsage: onUsage})
+}
+
+// StreamWithOptions 一步到位版本（自动开流 + 心跳 + 解析）。
+// server 流式主路径用 NewSSEWriter + Run 两段式，以便在连上游之前就把流开出去。
+func StreamWithOptions(w http.ResponseWriter, r io.Reader, opts StreamOptions) error {
+	s := NewSSEWriter(w, opts.Model)
+	s.StartHeartbeat(opts.Heartbeat)
+	defer s.Close()
+	return s.Run(r, opts)
+}
+
+// textAcc 累积上游文本并回答「这次该增量下发什么」。
+//
+// 上游有两种下发方式：
+//   - 增量（实测主流路径）：data.response 是本次新增的片段
+//   - 累计快照（历史版本 / 重放帧）：data.response 是「到目前为止的完整文本」
+//
+// 默认按**增量**处理（这符合实测的上游行为）；只有当出现「新片段以已累计内容
+// 开头且更长」这种快照的铁证时，才把该流切换成快照模式。反转过来的默认值
+// （先假设快照）会把合法的短增量误判成旧快照丢掉——思考链的每帧经常只有
+// 1~2 个字，恰好是已累计内容的前缀。
+type textAcc struct {
+	raw  strings.Builder
+	mode accMode
+}
+
+type accMode int
+
+const (
+	accDelta    accMode = iota // 增量（默认）
+	accSnapshot                // 累计快照
+)
+
+// add 返回本次应下发的增量片段（空串 = 无需下发）。
+func (a *textAcc) add(piece string) string {
+	if piece == "" {
+		return ""
+	}
+	cur := a.raw.String()
+	if cur == "" {
+		a.raw.WriteString(piece)
+		return piece
+	}
+	switch a.mode {
+	case accSnapshot:
+		switch {
+		case piece == cur:
+			return ""
+		case strings.HasPrefix(piece, cur):
+			out := piece[len(cur):]
+			a.raw.WriteString(out)
+			return out
+		case strings.HasPrefix(cur, piece):
+			return "" // 乱序到达的旧快照
+		default:
+			// 快照被上游改写（少见）：整体替换，差额按新增下发。
+			a.raw.Reset()
+			a.raw.WriteString(piece)
+			return piece
+		}
+	default: // accDelta
+		// 快照铁证：新片段以全部已累计内容开头且更长 → 后续按快照处理。
+		if len(piece) > len(cur) && strings.HasPrefix(piece, cur) {
+			a.mode = accSnapshot
+			out := piece[len(cur):]
+			a.raw.WriteString(out)
+			return out
+		}
+		a.raw.WriteString(piece)
+		return piece
+	}
+}
+
+// String 返回已下发的完整文本。
+func (a *textAcc) String() string { return a.raw.String() }
+
+// normalizeStreamToolCalls 把 SOLO tool_calls 归一化成 OpenAI 结构：
+// function_call → function，并剥掉 namespace / partial_arguments 等上游专属字段。
+func normalizeStreamToolCalls(raw json.RawMessage) ([]map[string]any, bool) {
+	var tc []map[string]any
+	if err := json.Unmarshal(raw, &tc); err != nil {
+		var one map[string]any
+		if err := json.Unmarshal(raw, &one); err != nil {
+			return nil, false
+		}
+		tc = []map[string]any{one}
+	}
+	if len(tc) == 0 {
+		return nil, false
+	}
+	for _, call := range tc {
+		if fc, ok := call["function_call"].(map[string]any); ok {
+			call["function"] = fc
+			delete(call, "function_call")
+		}
+		if fn, ok := call["function"].(map[string]any); ok {
+			delete(fn, "namespace")
+			delete(fn, "partial_arguments")
+		}
+	}
+	return tc, true
 }
 
 func jsonEscape(s string) string {

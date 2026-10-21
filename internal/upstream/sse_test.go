@@ -2,9 +2,12 @@ package upstream
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestPrepareBodyForcesStreamAndFunction(t *testing.T) {
@@ -314,5 +317,216 @@ func TestPrepareBodyToolCallWithoutNameDropped(t *testing.T) {
 	assistant := msgs[1].(map[string]any)
 	if _, has := assistant["tool_calls"]; has {
 		t.Error("tool_call without name should be dropped")
+	}
+}
+
+// 流式必须首帧带 role=assistant（部分客户端依赖它开气泡）。
+func TestStreamFirstChunkHasRole(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(soloSSEFixture)); err != nil {
+		t.Fatal(err)
+	}
+	first := strings.SplitN(strings.TrimSpace(rec.Body.String()), "\n", 2)[0]
+	if !strings.Contains(first, `"role":"assistant"`) {
+		t.Errorf("first chunk should carry role=assistant: %q", first)
+	}
+}
+
+// 整个流共用同一个 id 与 created；model 用调用方传入的值。
+func TestStreamStableIDCreatedAndModel(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if err := StreamWithOptions(rec, strings.NewReader(soloSSEFixture), StreamOptions{Model: "glm-5.2"}); err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	ids := map[string]bool{}
+	createds := map[string]bool{}
+	models := map[string]bool{}
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+			continue
+		}
+		if v, ok := m["id"].(string); ok {
+			ids[v] = true
+		}
+		if v, ok := m["created"].(float64); ok {
+			createds[fmt.Sprint(v)] = true
+		}
+		if v, ok := m["model"].(string); ok {
+			models[v] = true
+		}
+	}
+	if len(ids) != 1 {
+		t.Errorf("id must be stable across chunks, got %d distinct: %v", len(ids), ids)
+	}
+	if len(createds) != 1 {
+		t.Errorf("created must be stable across chunks, got %v", createds)
+	}
+	if len(models) != 1 || !models["glm-5.2"] {
+		t.Errorf("model should be the requested one, got %v", models)
+	}
+}
+
+// 上游发累计快照时不能重复拼正文（历史上会导致内容翻倍）。
+func TestStreamHandlesCumulativeSnapshots(t *testing.T) {
+	sse := "event:output\ndata:{\"response\":\"你好\",\"reasoning_content\":\"\",\"tool_calls\":null}\n\n" +
+		"event:output\ndata:{\"response\":\"你好世界\",\"reasoning_content\":\"\",\"tool_calls\":null}\n\n" +
+		"event:output\ndata:{\"response\":\"你好世界！\",\"reasoning_content\":\"\",\"tool_calls\":null}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(sse)); err != nil {
+		t.Fatal(err)
+	}
+	var got strings.Builder
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+			continue
+		}
+		ch := m["choices"].([]any)[0].(map[string]any)
+		if c, ok := ch["delta"].(map[string]any)["content"].(string); ok {
+			got.WriteString(c)
+		}
+	}
+	if got.String() != "你好世界！" {
+		t.Errorf("cumulative snapshot duplicated content: %q", got.String())
+	}
+}
+
+// 聚合路径同样要吃掉累计快照，且 model 取上游回报值。
+func TestAggregateHandlesSnapshotsAndModel(t *testing.T) {
+	sse := "event:metadata\ndata:{\"model\":\"glm-5.2\",\"session_id\":\"x\"}\n\n" +
+		"event:output\ndata:{\"response\":\"你好\",\"reasoning_content\":\"\"}\n\n" +
+		"event:output\ndata:{\"response\":\"你好世界\",\"reasoning_content\":\"\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	resp, err := Aggregate(strings.NewReader(sse))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp["model"] != "glm-5.2" {
+		t.Errorf("model=%v", resp["model"])
+	}
+	msg := resp["choices"].([]any)[0].(map[string]any)["message"].(map[string]any)
+	if msg["content"] != "你好世界" {
+		t.Errorf("content=%q (snapshot duplicated)", msg["content"])
+	}
+}
+
+// 上游心跳/排队事件要转成 SSE 注释保活，而不是被静默丢弃。
+func TestStreamForwardsHeartbeatAsComment(t *testing.T) {
+	sse := "event:heartbeat\ndata:{}\n\n" +
+		"event:progress_notice\ndata:{\"text\":\"排队中\"}\n\n" +
+		"event:output\ndata:{\"response\":\"hi\",\"reasoning_content\":\"\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(sse)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), ": keepalive") {
+		t.Errorf("heartbeat not forwarded: %q", rec.Body.String())
+	}
+}
+
+// 上游静默时也必须持续吐保活注释（否则客户端/代理会判定卡死）。
+func TestStreamHeartbeatDuringSilence(t *testing.T) {
+	pr, pw := io.Pipe()
+	rec := httptest.NewRecorder()
+	errc := make(chan error, 1)
+	go func() {
+		errc <- StreamWithOptions(rec, pr, StreamOptions{Heartbeat: 20 * time.Millisecond})
+	}()
+	// 上游先静默 150ms，再发正文与 done。
+	time.Sleep(150 * time.Millisecond)
+	io.WriteString(pw, "event:output\ndata:{\"response\":\"hi\",\"reasoning_content\":\"\"}\n\n")
+	io.WriteString(pw, "event:done\ndata:{\"finish_reason\":\"stop\"}\n\n")
+	pw.Close()
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
+	body := rec.Body.String()
+	n := strings.Count(body, ": keepalive")
+	if n < 3 {
+		t.Errorf("expected >=3 keepalives during 150ms silence, got %d", n)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("missing DONE")
+	}
+}
+
+// plan_item 的思考面要转成 reasoning_content 增量。
+func TestStreamPlanItemReasoning(t *testing.T) {
+	sse := "event:plan_item\ndata:{\"thought\":\"先想一想\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(sse)); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rec.Body.String(), `"reasoning_content":"先想一想"`) {
+		t.Errorf("plan_item reasoning missing: %q", rec.Body.String())
+	}
+}
+
+// ThinkingContent 模式：思考要当正文增量下发，并用 think 标签包裹。
+func TestStreamThinkingInContent(t *testing.T) {
+	sse := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"想一\"}\n\n" +
+		"event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"想\"}\n\n" +
+		"event:output\ndata:{\"response\":\"答案\",\"reasoning_content\":\"\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := StreamWithOptions(rec, strings.NewReader(sse), StreamOptions{Thinking: ThinkingContent}); err != nil {
+		t.Fatal(err)
+	}
+	var got strings.Builder
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+			continue
+		}
+		ch := m["choices"].([]any)[0].(map[string]any)
+		if c, ok := ch["delta"].(map[string]any)["content"].(string); ok {
+			got.WriteString(c)
+		}
+	}
+	out := got.String()
+	if !strings.HasPrefix(out, " thinking") {
+		t.Errorf("thinking should be wrapped in think tag: %q", out)
+	}
+	if !strings.Contains(out, "想一想") {
+		t.Errorf("thinking text lost: %q", out)
+	}
+	if !strings.Contains(out, "答案") {
+		t.Errorf("answer missing: %q", out)
+	}
+	if strings.Count(out, " thinking") != 1 {
+		t.Errorf("think tag opened more than once: %q", out)
+	}
+}
+
+// ThinkingNone 模式：思考必须完全丢弃。
+func TestStreamThinkingNoneDropsReasoning(t *testing.T) {
+	sse := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"秘密思考\"}\n\n" +
+		"event:output\ndata:{\"response\":\"答案\",\"reasoning_content\":\"\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := StreamWithOptions(rec, strings.NewReader(sse), StreamOptions{Thinking: ThinkingNone}); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rec.Body.String(), "秘密思考") {
+		t.Errorf("ThinkingNone must drop reasoning: %q", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "答案") {
+		t.Errorf("answer missing")
 	}
 }

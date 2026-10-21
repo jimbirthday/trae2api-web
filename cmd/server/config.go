@@ -53,6 +53,20 @@ type Config struct {
 		RetainDays int    `json:"retain_days"` // 保留天数（默认 7）
 	} `json:"reqlog"`
 
+	Stream struct {
+		// Thinking 思考内容的呈现方式（上游 SOLO 会先长时间思考再给正文）：
+		//   "reasoning"（默认）→ 放进 delta.reasoning_content（DeepSeek 约定，
+		//                       Cherry Studio / Chatbox / OpenWebUI 等会渲染成「思考过程」）
+		//   "content"         → 包进  thinking…<｜end▁of▁thinking｜> 作为正文增量（空档期就有字在动，
+		//                       与 trae-cn-relay 等中转的默认行为一致；只渲染 content
+		//                       的客户端——Cline / Zed / 各类 CLI——能立刻看到输出）
+		//   "none"            → 丢弃思考，只输出正文（最省 token，但空档期最长）
+		Thinking string `json:"thinking"`
+		// Heartbeat 空闲保活间隔（Go duration 字符串）。上游静默超过该时长就写
+		// 一行 SSE 注释，避免客户端/中间代理判定卡死。"0" 或 "off" = 关闭。
+		Heartbeat string `json:"heartbeat"`
+	} `json:"stream"`
+
 	Usage struct {
 		Enabled        bool   `json:"enabled"`         // 按模型用量统计（默认 true）
 		File           string `json:"file"`            // "./data/usage.json"
@@ -82,9 +96,18 @@ type Config struct {
 	DegradeWindowDur time.Duration `json:"-"`
 	// CreditSamplingDur 积分采样节流窗口；0 = 关闭积分采样（token/缓存统计不受影响）。
 	CreditSamplingDur time.Duration `json:"-"`
+	// StreamHeartbeat 空闲保活间隔；0 = 关闭心跳。
+	StreamHeartbeat   time.Duration `json:"-"`
 	SessionTTL        time.Duration `json:"-"`
 	SessionGCDuration time.Duration `json:"-"`
 }
+
+// 思考内容呈现方式。
+const (
+	StreamThinkingReasoning = "reasoning" // delta.reasoning_content（默认）
+	StreamThinkingContent   = "content"   // 包进  thinking…<｜end▁of▁thinking｜> 作为正文
+	StreamThinkingNone      = "none"      // 丢弃
+)
 
 // ModelErrorRuleConfig 配置层的模型级错误规则（转成 upstream.ModelErrorRule）。
 type ModelErrorRuleConfig struct {
@@ -126,6 +149,9 @@ func Default() *Config {
 	c.ReqLog.Dir = "./data/logs"
 	c.ReqLog.FileMaxMB = 16
 	c.ReqLog.RetainDays = 7
+
+	c.Stream.Thinking = StreamThinkingReasoning
+	c.Stream.Heartbeat = "1s"
 
 	c.Usage.Enabled = true
 	c.Usage.File = "./data/usage.json"
@@ -178,6 +204,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("TW2A_DEFAULT_MODEL"); v != "" {
 		c.DefaultModel = v
+	}
+	if v := os.Getenv("TW2A_STREAM_THINKING"); v != "" {
+		c.Stream.Thinking = v
+	}
+	if v := os.Getenv("TW2A_STREAM_HEARTBEAT"); v != "" {
+		c.Stream.Heartbeat = v
 	}
 	if v := os.Getenv("TW2A_PLAN_CREDIT"); v != "" {
 		c.Cooldown.PlanCredit = v
@@ -286,6 +318,29 @@ func (c *Config) normalize() error {
 	}
 	if c.CreditSamplingDur < 0 {
 		return fmt.Errorf("usage.credit_sampling: 不能为负")
+	}
+	c.Stream.Thinking = strings.ToLower(strings.TrimSpace(c.Stream.Thinking))
+	switch c.Stream.Thinking {
+	case "":
+		c.Stream.Thinking = StreamThinkingReasoning
+	case StreamThinkingReasoning, StreamThinkingContent, StreamThinkingNone:
+	default:
+		return fmt.Errorf("stream.thinking: 只能是 %q / %q / %q，收到 %q",
+			StreamThinkingReasoning, StreamThinkingContent, StreamThinkingNone, c.Stream.Thinking)
+	}
+	hb := strings.ToLower(strings.TrimSpace(c.Stream.Heartbeat))
+	switch hb {
+	case "", "off":
+		c.StreamHeartbeat = 0
+	default:
+		d, derr := time.ParseDuration(hb)
+		if derr != nil {
+			return fmt.Errorf("stream.heartbeat: %w", derr)
+		}
+		if d < 0 {
+			return fmt.Errorf("stream.heartbeat: 不能为负")
+		}
+		c.StreamHeartbeat = d
 	}
 	if c.Usage.File == "" {
 		c.Usage.File = "./data/usage.json"

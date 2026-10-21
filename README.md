@@ -33,6 +33,7 @@
 - **多账号智能调度池**：加权选号（余额 × 闲置补偿 × 手动权重 × 连败降权）、Top5 加权随机打散、单账号在途租约限流、账号级 + 模型级两级冷却、软限流指数退避、熔断与连败降权、会话粘性、超时/断连不误罚号。
 - **自动化运维与保活**：每日定时自动签到，并在 Token 过期前 24 小时自动预刷新与原子落盘，保障长周期稳定可用。
 - **新模型支持**：同步支持 glm-5.3、glm-5.2 等新版模型调度，适配最新协议版本。
+- **丝滑的流式输出**：响应头 + `role` 帧在**毫秒级**下发（不等上游握手），段内逐帧 flush，跨 chunk 恒定 `id`/`created`/`model`；上游思考期由心跳 SSE 注释保活，思考内容可按 `stream.thinking` 选择走 `reasoning_content` 或包 `think` 标签当正文输出。
 - **纯净轻量**：纯 Go 标准库开发，零第三方运行时依赖，静态编译产物小巧，内存占用极低。
 
 ## 快速开始
@@ -256,6 +257,8 @@ TRAE 是无状态全量上下文，粘性不解决上下文拼接，但能避免
 | `TW2A_REQLOG_ENABLED` | `true` | 是否记录请求流水 |
 | `TW2A_REQLOG_DIR` | `./data/logs` | 请求流水归档目录 |
 | `TW2A_REQLOG_RETAIN_DAYS` | `7` | 归档保留天数 |
+| `TW2A_STREAM_THINKING` | `content` | 思考内容呈现：`reasoning`（走 `reasoning_content`）/ `content`（包 `think` 标签当正文，空档期立刻有字）/ `none`（丢弃） |
+| `TW2A_STREAM_HEARTBEAT` | `1s` | 空闲保活间隔（上游静默时写 SSE 注释，防代理掐断）；`0`/`off` 关闭 |
 | `TW2A_USAGE_ENABLED` | `true` | 是否统计按模型用量（token/缓存/积分采样） |
 | `TW2A_USAGE_FILE` | `./data/usage.json` | 用量统计持久化文件 |
 | `TW2A_CREDIT_SAMPLING` | `30s` | 积分采样窗口（`0` = 关闭积分采样） |

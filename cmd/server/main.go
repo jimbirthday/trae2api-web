@@ -118,22 +118,33 @@ func main() {
 		log.Printf("usage stats enabled (file=%s, credit_sampling=%s)", cfg.Usage.File, cfg.CreditSamplingDur)
 	}
 
+	// 思考呈现方式：把配置字符串映射成 upstream.ThinkingMode。
+	thinkingMode := upstream.ThinkingReasoning
+	switch cfg.Stream.Thinking {
+	case StreamThinkingContent:
+		thinkingMode = upstream.ThinkingContent
+	case StreamThinkingNone:
+		thinkingMode = upstream.ThinkingNone
+	}
+
 	h := server.NewHandler(server.Config{
-		Pool:          p,
-		Upstream:      up,
-		APIKey:        cfg.APIKey,
-		AuthDir:       cfg.AuthDir,
-		PlanCooldown:  cfg.PlanCreditDur,
-		SoftCooldown:  cfg.SoftRateDur,
-		ErrThreshold:  cfg.Pool.BreakerThreshold,
-		ErrCooldown:   cfg.ErrCooldownDur,
-		DefaultModel:  cfg.DefaultModel,
-		RefreshSkew:   24 * time.Hour,
-		Session:       sess,
-		RequestLog:    rl,
-		Usage:         usageTracker,
-		CreditSampler: creditSampler,
-		ConfigPath:    *cfgPath,
+		Pool:            p,
+		Upstream:        up,
+		APIKey:          cfg.APIKey,
+		AuthDir:         cfg.AuthDir,
+		PlanCooldown:    cfg.PlanCreditDur,
+		SoftCooldown:    cfg.SoftRateDur,
+		ErrThreshold:    cfg.Pool.BreakerThreshold,
+		ErrCooldown:     cfg.ErrCooldownDur,
+		DefaultModel:    cfg.DefaultModel,
+		RefreshSkew:     24 * time.Hour,
+		Session:         sess,
+		RequestLog:      rl,
+		Usage:           usageTracker,
+		CreditSampler:   creditSampler,
+		ConfigPath:      *cfgPath,
+		StreamThinking:  thinkingMode,
+		StreamHeartbeat: cfg.StreamHeartbeat,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
