@@ -150,6 +150,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	lastRateLimited := false
 	rotates := 0
+	// 上游响应头超时的重试次数。上限 1 次，不跟 MaxRotate 走：
+	// 每次超时要等满 upstream.timeout_seconds（默认 120s），跟着轮转上限跑
+	// 会把客户端拖到 3×120s，等到的多半是自己先超时。
+	timeoutRetries := 0
+	const maxTimeoutRetries = 1
 
 	// 流式响应的 SSE 写入器：**惰性创建**，但在连上游之前就创建好。
 	//
@@ -261,8 +266,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			retryAfter = uerr.RetryAfter
 		}
 		if terr != nil {
-			// 超时 / 客户端断连：不是账号的问题，换号只会拖长请求并误罚健康号。
-			if upstream.IsUpstreamTimeout(terr) || upstream.IsClientGone(terr) || r.Context().Err() != nil {
+			// 超时 / 客户端断连：都不是账号的错，不做冷却/熔断/降权。
+			clientGone := upstream.IsClientGone(terr) || r.Context().Err() != nil
+			if clientGone || upstream.IsUpstreamTimeout(terr) {
 				h.cfg.Pool.ReleaseToken(leaseToken)
 				// 只计数、不罚号：不喂 NoteError（不计熔断额度）、不喂 NoteFailures（不降权）。
 				h.cfg.Pool.NoteTransportError(acct.UID)
@@ -270,7 +276,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				rec.Error = sanitizeErrMsg(terr.Error())
 				log.Printf("WARN: [server] upstream timeout/client-gone acct=%s: %v (account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
-				break
+				// 客户端已经走了：没人接收结果，重试纯属浪费一次上游推理。
+				if clientGone {
+					break
+				}
+				// 上游超时：号池存在的意义就是「这条链路不行换下一个」，
+				// 一次超时就把整个请求判死会让「单号链路抖动」升级成「全站不可用」。
+				// 但要限制次数——超时是耗时型错误，不是立即失败的 429。
+				timeoutRetries++
+				if timeoutRetries > maxTimeoutRetries || !h.cfg.Pool.HasRotatable(tried, configName) {
+					break
+				}
+				log.Printf("WARN: [server] upstream timeout, retry with another account (%d/%d) model=%s",
+					timeoutRetries, maxTimeoutRetries, configName)
+				if !rotateBackoff(rotates, r.Context()) {
+					break
+				}
+				rotates++
+				rec.Rotates = rotates
+				continue
 			}
 			h.cfg.Pool.ReleaseToken(leaseToken)
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -468,7 +492,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg := "all accounts unavailable (cooling/disabled)"
+	// 走到这里说明没有任何一次尝试成功。文案必须如实反映**真实原因**：
+	// 以前一律用「all accounts unavailable (cooling/disabled)」打头，于是一个
+	// 上游超时会被读成「所有账号都被冷却了」，把排查方向直接带偏（区号池状态、
+	// 明明 5 个号都健康）。现在分三种语义：模型级封禁 / 根本没号可试 / 试过但失败。
+	status := http.StatusServiceUnavailable
+	code := "no_healthy_account"
+	msg := "no account available for this model (all cooling/disabled/paused)"
+	if len(tried) > 0 {
+		// 有账号被真正尝试过 → 不是「无号可用」，而是「试了但都失败」。
+		msg = fmt.Sprintf("all %d account attempt(s) failed", len(tried))
+	}
 	if mb := h.cfg.Pool.ModelBlocked(configName); mb.Blocked {
 		// 账号都在，但每个号都对该模型处于模型级冷却：语义不同，需明确区分。
 		msg = fmt.Sprintf("model %q is blocked on all accounts until %s",
@@ -484,9 +518,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 不直接回给客户端。
 		rec.Error = sanitizeErrMsg(msg + ": " + lastErr.Error())
 		msg += ": " + publicStreamErrMsg(lastErr)
+		if upstream.IsUpstreamTimeout(lastErr) {
+			// 504 而不是 503：超时是「等太久」，客户端/网关的语义是按可重试处理，
+			// 与「没有可用账号」区分开，也便于监控按码分类。
+			status = http.StatusGatewayTimeout
+			code = "upstream_timeout"
+		}
 	}
 	rec.Outcome = reqlog.OutcomeHTTPError
-	rec.Status = http.StatusServiceUnavailable
+	rec.Status = status
 	if rec.Error == "" {
 		rec.Error = msg
 	}
@@ -497,7 +537,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		sse.WriteError(redactUpstream(msg))
 		return
 	}
-	writeChatError(w, rec, http.StatusServiceUnavailable, "no_healthy_account", msg)
+	writeChatError(w, rec, status, code, msg)
 }
 
 // chatClientIP 取真实客户端 IP：X-Forwarded-For 首段 → X-Real-IP → RemoteAddr。

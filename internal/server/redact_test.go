@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -138,5 +140,96 @@ func TestWriteOpenAIErrorRedacts(t *testing.T) {
 	writeOpenAIError(w, 502, "upstream_parse", fmt.Errorf("wrap: %w", fakeTimeoutErr()).Error())
 	if strings.Contains(w.Body.String(), "mchost") {
 		t.Fatalf("leak: %s", w.Body.String())
+	}
+}
+
+// 上游超时要换下一个号再试一次，而不是一次就把整个请求判死。
+// 号池存在的意义就是这条链路不行换下一个。
+func TestUpstreamTimeoutRotatesToAnotherAccount(t *testing.T) {
+	var tried []string
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		if strings.Contains(authz, "at-first") {
+			return 0, "", false // 由下面的 transport 抛错
+		}
+		return 200, soloSSE, true
+	})
+	up.StreamHTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		tried = append(tried, r.Header.Get("Authorization"))
+		if strings.Contains(r.Header.Get("Authorization"), "at-first") {
+			return nil, fakeTimeoutErr()
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(soloSSE)),
+		}, nil
+	})}
+	p := testPoolWith(
+		&auth.Auth{UID: "first", AccessToken: "at-first", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "second", AccessToken: "at-second", ExpiresAt: 9999999999},
+	)
+	// 只留一个可用号时无法验证轮转，先把 first 的权重与顺序钉住已经靠 pool 打散，
+	// 因此这里断言「至少打了 2 次上游」而不是具体顺序。
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if len(tried) < 2 {
+		t.Fatalf("timeout should retry another account, upstream calls=%d", len(tried))
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body)
+	}
+}
+
+// 全部账号都超时时：状态码 504、code=upstream_timeout，且文案不再谎称「账号冷却」。
+func TestAllAccountsTimeoutReportsUpstreamTimeout(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, soloSSE, true })
+	up.StreamHTTP = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fakeTimeoutErr()
+	})}
+	up.StreamIdleTimeout = -1
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at-1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at-2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if w.Code != http.StatusGatewayTimeout {
+		t.Fatalf("code=%d want 504, body=%s", w.Code, body)
+	}
+	if !strings.Contains(body, "upstream_timeout") {
+		t.Errorf("want code=upstream_timeout: %s", body)
+	}
+	// 关键回归点：不能再出现「所有账号冷却/禁用」这种与事实不符的措辞。
+	if strings.Contains(body, "cooling/disabled") {
+		t.Errorf("timeout must not be reported as all accounts cooling/disabled: %s", body)
+	}
+}
+
+// 客户端主动断开（非上游超时）不应触发重试：没人接收结果，重试纯属浪费。
+func TestClientGoneDoesNotRetry(t *testing.T) {
+	calls := 0
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, soloSSE, true })
+	up.StreamHTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return nil, context.Canceled
+	})}
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at-1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at-2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if calls != 1 {
+		t.Fatalf("client-gone must not retry, upstream calls=%d", calls)
 	}
 }

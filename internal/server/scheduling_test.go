@@ -110,8 +110,13 @@ func TestChatUpstreamTimeoutDoesNotPenalize(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
-		t.Fatalf("code=%d", rec.Code)
+	// 504 而非 503：超时是「等太久」，语义上与「没有可用账号」不同，
+	// 客户端/网关对 504 的重试语义也更明确。
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Fatalf("code=%d want 504", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_timeout") {
+		t.Errorf("want code=upstream_timeout, body=%s", rec.Body)
 	}
 	st, _ := p.Status("u0")
 	// 「不罚号」的准确含义：不影响选号资格。errTotal 允许 +1（仅用于观测，
@@ -144,8 +149,9 @@ func TestChat429UsesSoftCooldown(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != 503 {
-		t.Fatalf("code=%d", rec.Code)
+	// 429 是上游限流，仍是 503（没有可用账号），不能因为改超时语义被带成 504。
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("code=%d want 503", rec.Code)
 	}
 	st, _ := p.Status("u0")
 	if !st.Cooling || st.CoolKind != "soft_rate" {

@@ -243,6 +243,25 @@ TTL 默认 30 分钟滚动续期。命中账号若因冷却/在途满/模型限�
 若用「未命中就按 hash 直接分配」的写法，粘性会把加权选号整个架空。
 TRAE 是无状态全量上下文，粘性不解决上下文拼接，但能避免同一会话在账号间跳变导致的上游判定漂移。
 
+### 上游失败时的错误语义
+
+所有尝试都失败时，错误里的 `code` 与文案**如实反映真实原因**，不再一律说「账号都被冷却」：
+
+| 情况 | HTTP | `error.code` | message 形态 |
+|---|---|---|---|
+| 所有号都对该模型处于模型级冷却 | 503 | `model_blocked` | `model "x" is blocked on all accounts until <时间>` |
+| 没有任何号可试（冷却/禁用/暂停/在途满） | 503 | `no_healthy_account` | `no account available for this model (all cooling/disabled/paused)` |
+| 试过 N 个号但都失败 | 503 | `no_healthy_account` | `all N account attempt(s) failed: <原因>` |
+| 其中原因是上游超时 | **504** | `upstream_timeout` | `all N account attempt(s) failed: upstream timed out before responding; please retry` |
+
+上游超时会**换下一个号再试一次**（只重试 1 次，不跟 `max_rotate` 走：每次超时要等满
+`upstream.timeout_seconds`，跟着轮转跑会把客户端拖到 3×120s）。客户端主动断开则**不重试**——
+没人接收结果，重试纯属浪费一次上游推理。
+
+超时与客户端断连都**不罚号**（不计熔断额度、不连败降权），只累加 `err_total` 供观测。
+
+响应体里**永远不含上游地址**（域名/IP/端口都会被替换为 `<upstream>`），完整原因只进日志与请求流水。
+
 ### 在途租约
 
 每个账号默认最多 2 个并发在途请求（`pool.max_in_flight`），超出时选号直接跳过，
