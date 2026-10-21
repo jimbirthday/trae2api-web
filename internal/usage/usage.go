@@ -196,7 +196,14 @@ func (t *Tracker) Snapshot() Snapshot {
 	})
 	totals.Model = "全部模型"
 	totals.CacheRatePct = cacheRatePct(totals.CacheReadTokens, totals.PromptTokens)
-	totals.CreditsPerMillion = medianOf(totals.Samples)
+	// 整体积分/百万 token 用「加权」口径：总积分 / 总 token。
+	// 不能对各模型的样本混在一起取中位数——不同模型的单价差异很大，
+	// 混合中位数会给出一个谁都不对应的数字。
+	if totals.SampledTokens > 0 {
+		totals.CreditsPerMillion = totals.SampledCredits / float64(totals.SampledTokens) * 1e6
+	} else {
+		totals.CreditsPerMillion = medianOf(totals.Samples)
+	}
 	return Snapshot{
 		StartedAt:                 started,
 		UpdatedAt:                 updated,

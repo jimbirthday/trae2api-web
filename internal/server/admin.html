@@ -178,9 +178,11 @@
         Token 与缓存率为<b>全量精确</b>（取自每个请求的 <code>token_usage</code> 事件）；
         「积分/百万」为<b>窗口采样估算</b>——上游只提供账号级累计计数器且异步结算，
         因此按「一个窗口内的积分增量 ÷ 同窗口 token 总量」计算，再按 token 比例分摊到模型，
-        取多次样本的中位数抗离群。样本数见末列，样本为 0（刚启动或窗口未满）时显示 "-"。
+        取多次样本的中位数抗离群。样本数见末列，样本为 0（刚启动或窗口未满）时显示 "-"。<br>
+        <b>整体口径</b>：缓存率 = 全部模型 cache_read ÷ prompt（加权）；积分/百万 = 全部分摊积分 ÷ 全部 token（加权）。
       </div>
     </div>
+    <div class="grid" id="usageKpi" style="margin-bottom:14px"></div>
     <div id="usageTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
   </div>
 
@@ -419,6 +421,19 @@ function renderUsage(snap){
   const el = document.getElementById('usageTable');
   const rows = (snap.models||[]);
   const t = snap.totals || {};
+  // 顶部 KPI：整体缓存率 + 整体积分/百万 + 请求量
+  const kpi = document.getElementById('usageKpi');
+  if(kpi){
+    const card = (label,val,sub)=>'<div class="card" style="padding:14px 16px"><div style="font-size:11px;color:var(--dim);margin-bottom:6px">'+label+'</div>'
+      +'<div style="font-size:22px;font-weight:600" class="mono">'+val+'</div>'
+      +(sub?'<div style="font-size:11px;color:var(--dim);margin-top:6px">'+sub+'</div>':'')+'</div>';
+    kpi.innerHTML = card('整体平均缓存率', pct(t.cache_rate_pct),
+                        fmt(t.cache_read_tokens||0)+' / '+fmt(t.prompt_tokens||0)+' input tokens')
+      + card('整体平均积分 / 百万 token', cpm(t.credits_per_million),
+             t.credit_samples?('采样 '+fmt(t.credit_samples)+' 次 · 累计 '+(t.sampled_credits||0).toFixed(2)+' 积分'):'窗口未满，暂无采样')
+      + card('累计请求', fmt(t.requests),
+             rows.length+' 个模型 · 总计 '+fmt(t.total_tokens||0)+' tokens');
+  }
   if(!rows.length){
     el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无用量数据（发一次对话后即有）。</div>';
     return;

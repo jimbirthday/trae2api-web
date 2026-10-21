@@ -228,3 +228,24 @@ func TestSamplerPerAccountWindows(t *testing.T) {
 		t.Fatalf("each account opens its own window once: %v", reads)
 	}
 }
+
+// 整体「积分/百万 token」必须是加权口径（总积分/总token），
+// 不能把不同模型的样本混在一起取中位数。
+func TestTotalsCreditsPerMillionIsWeighted(t *testing.T) {
+	tr := New("", time.Minute)
+	defer tr.Close()
+	// A：便宜模型，1M token / 10 积分 → 10 积分/百万
+	tr.AddCreditSample("A", 10, 1_000_000)
+	// B：贵模型，1M token / 90 积分 → 90 积分/百万
+	tr.AddCreditSample("B", 90, 1_000_000)
+
+	s := tr.Snapshot()
+	if s.Models == nil || len(s.Models) != 2 {
+		t.Fatalf("models=%+v", s.Models)
+	}
+	// 两个模型合计 100 积分 / 2M token = 50
+	if diff := s.Totals.CreditsPerMillion - 50; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("totals cpm=%.4f want 50 (weighted), samples=%v",
+			s.Totals.CreditsPerMillion, s.Totals.Samples)
+	}
+}
