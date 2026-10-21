@@ -427,8 +427,15 @@ func (s *Scheduler) runRefresh(ctx context.Context) {
 			}
 			return
 		}
+		// 同 chat 路径：refreshToken 已在上游轮换，落盘失败意味着重启后这个号
+		// 就废了（旧 refreshToken 立即失效）。瞬时 IO 抖动很常见，先重试一次；
+		// 仍失败必须打成显眼告警，否则这种「沉默的账号报废」没人会发现。
 		if err := a.SaveAtomic(); err != nil {
-			log.Printf("refresh %s save: %v", label, err)
+			log.Printf("ERROR: refresh %s 落盘失败，重试: %v", label, err)
+			if err2 := a.SaveAtomic(); err2 != nil {
+				log.Printf("ERROR: !!! refresh %s 落盘仍失败: %v —— refreshToken 已轮换，"+
+					"重启后需重新登录该账号", label, err2)
+			}
 		}
 	})
 }

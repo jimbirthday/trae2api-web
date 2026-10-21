@@ -238,7 +238,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rec.Rotates = rotates
 			continue
 		} else if refreshed {
-			_ = acct.SaveAtomic()
+			// 落盘失败不能静默吞掉：refreshToken 已在上游轮换（旧的立即失效），
+			// 内存里是新值但磁盘还是旧值 —— 一旦进程重启，这个账号就再也刷不
+			// 出新 accessToken，只能重新登录。重试一次（瞬时 IO 抖动很常见），
+			// 仍失败则打显著告警并让本次请求继续（不因为落盘问题打断用户对话）。
+			if serr := acct.SaveAtomic(); serr != nil {
+				log.Printf("ERROR: [server] token 落盘失败，重试 uid=%s err=%v",
+					logfmt.Label(acct.UID, acct.Nickname), serr)
+				if serr2 := acct.SaveAtomic(); serr2 != nil {
+					log.Printf("ERROR: !!! token 落盘仍失败 uid=%s err=%v —— refreshToken 已轮换，"+
+						"重启后该账号需重新登录（否则会一直 401）",
+						logfmt.Label(acct.UID, acct.Nickname), serr2)
+				}
+			}
 		}
 
 		// 带 ctx 发请求：客户端断开（用户关闭页面/取消）时立刻中止上游连接，
