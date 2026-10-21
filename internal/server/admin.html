@@ -210,7 +210,9 @@
         「积分/百万」为<b>窗口采样估算</b>——上游只提供账号级累计计数器且异步结算，
         因此按「一个窗口内的积分增量 ÷ 同窗口 token 总量」计算，再按 token 比例分摊到模型，
         取多次样本的中位数抗离群。样本数见末列，样本为 0（刚启动或窗口未满）时显示 "-"。<br>
-        <b>整体口径</b>：缓存率 = 全部模型 cache_read ÷ prompt（加权）；积分/百万 = 全部分摊积分 ÷ 全部 token（加权）。
+        <b>整体口径</b>：缓存率 = 全部模型 cache_read ÷ prompt（加权）；积分/百万 = 全部分摊积分 ÷ 全部 token（加权）；
+        <b>吞吐</b> = 累计 output token ÷ 累计「首帧→末帧」生成时长（加权，不是各请求的算术平均），旁边的小字是同一区间的字符速率——
+        若 token/s 正常而字/s 明显偏低，说明瓶颈在本端下发；反之则是上游生成慢。
       </div>
     </div>
     <div class="grid" id="usageKpi" style="margin-bottom:14px"></div>
@@ -614,6 +616,8 @@ function renderUsage(snap){
                         fmt(t.cache_read_tokens||0)+' / '+fmt(t.prompt_tokens||0)+' input tokens')
       + card('整体平均积分 / 百万 token', cpm(t.credits_per_million),
              t.credit_samples?('采样 '+fmt(t.credit_samples)+' 次 · 累计 '+(t.sampled_credits||0).toFixed(2)+' 积分'):'窗口未满，暂无采样')
+      + card('整体平均吞吐', tps(t.avg_tps)+' tok/s',
+             t.timing_samples?(fmt(t.timed_completion_tokens||0)+' token / '+fmt(Math.round((t.gen_ms_sum||0)/1000))+'s 生成 · 首字 '+ms(t.avg_ttft_ms)+'ms'):'暂无流式样本')
       + card('累计请求', fmt(t.requests),
              fmt(usageState.total)+' 个模型 · 总计 '+fmt(t.total_tokens||0)+' tokens');
   }
@@ -625,7 +629,9 @@ function renderUsage(snap){
     + label + (usageState.sort===key? ' ↓':'')+'</th>';
   let html = '<table class="accts"><thead><tr>'
     + sortBtn('model','模型')+sortBtn('requests','请求')+sortBtn('tokens','输入 token')
-    + '<th>输出 token</th><th>缓存命中</th>'+sortBtn('cache','缓存率')+sortBtn('credits','积分/百万 token')+'<th>采样</th>'
+    + '<th>输出 token</th><th>缓存命中</th>'+sortBtn('cache','缓存率')+sortBtn('credits','积分/百万 token')
+    + sortBtn('tps','吞吐')+'<th title="客户端看到第一个字（含选号/建连/上游排队/首包）">首字</th>'
+    + '<th title="首帧→末帧的纯生成时长">平均生成</th><th title="计时样本数（流式）／积分采样次数">样本</th>'
     + '</tr></thead><tbody>';
   for(const m of rows){
     html += '<tr>'
@@ -636,7 +642,13 @@ function renderUsage(snap){
       + '<td class="mono">'+fmt(m.cache_read_tokens||0)+'</td>'
       + '<td class="mono">'+pct(m.cache_rate_pct)+'</td>'
       + '<td class="mono">'+cpm(m.credits_per_million)+'</td>'
-      + '<td class="mono" style="color:var(--dim)" title="采样越多越可信（取中位数抗离群）">'+fmt(m.credit_samples||0)+'</td>'
+      + '<td class="mono" title="加权吞吐：累计 output token ÷ 累计生成时长">'+tps(m.avg_tps)+' tok/s'
+        + (m.avg_char_ps? '<div style="font-size:10px;color:var(--dim)">'+tps(m.avg_char_ps)+' 字/s</div>':'')
+        + '</td>'
+      + '<td class="mono" style="color:var(--dim)">'+ms(m.avg_ttft_ms)+'ms</td>'
+      + '<td class="mono" style="color:var(--dim)">'+ms(m.avg_gen_ms)+'ms</td>'
+      + '<td class="mono" style="color:var(--dim)" title="计时样本数（仅流式、有生成时长）">'+fmt(m.timing_samples||0)
+        + (m.credit_samples? '<div style="font-size:10px">积分 '+fmt(m.credit_samples)+'</div>':'')+'</td>'
       + '</tr>';
   }
   // 合计行（加权，不是简单平均）
@@ -648,7 +660,13 @@ function renderUsage(snap){
     + '<td class="mono">'+fmt(t.cache_read_tokens||0)+'</td>'
     + '<td class="mono">'+pct(t.cache_rate_pct)+'</td>'
     + '<td class="mono">'+cpm(t.credits_per_million)+'</td>'
-    + '<td class="mono" style="color:var(--dim)">'+fmt(t.credit_samples||0)+'</td>'
+    + '<td class="mono">'+tps(t.avg_tps)+' tok/s'
+      + (t.avg_char_ps? '<div style="font-size:10px;color:var(--dim)">'+tps(t.avg_char_ps)+' 字/s</div>':'')
+      + '</td>'
+    + '<td class="mono" style="color:var(--dim)">'+ms(t.avg_ttft_ms)+'ms</td>'
+    + '<td class="mono" style="color:var(--dim)">'+ms(t.avg_gen_ms)+'ms</td>'
+    + '<td class="mono" style="color:var(--dim)">'+fmt(t.timing_samples||0)
+      + (t.credit_samples? '<div style="font-size:10px">积分 '+fmt(t.credit_samples)+'</div>':'')+'</td>'
     + '</tr></tbody></table>';
   el.innerHTML = html;
 }

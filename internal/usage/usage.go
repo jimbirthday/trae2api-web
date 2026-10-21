@@ -38,6 +38,19 @@ type ModelStat struct {
 	ReasoningTokens  int64     `json:"reasoning_tokens,omitempty"`
 	LastUsedAt       time.Time `json:"last_used_at,omitempty"`
 
+	// 流式吞吐聚合。只统计真正拿到了计时快照的流式请求
+	// （st.HasTiming 为真且有 completion_tokens），非流式不会进来污染均值。
+	//
+	// 与 avg_tps 的差别：这里同时保留「分子总量」和「分母总量」，
+	// 因此可以算加权吞吐 = 全部 completion_tokens / 全部生成时长，
+	// 而不是各请求 TPS 的算术平均（后者会被「短请求」系统性拉偏）。
+	TimingSamples      int64 `json:"timing_samples,omitempty"`
+	GenMsSum           int64 `json:"gen_ms_sum,omitempty"`           // 首帧→末帧累计
+	TTFTMsSum          int64 `json:"ttft_ms_sum,omitempty"`          // 客户端首字累计
+	UpstreamTTFMsSum   int64 `json:"upstream_ttft_ms_sum,omitempty"` // 上游首帧累计
+	TimedCompletionTok int64 `json:"timed_completion_tokens,omitempty"`
+	CharsSum           int64 `json:"chars_sum,omitempty"` // 实际下发字符（正文+思考）
+
 	// 积分采样：每次采样记录「本次请求消耗的积分」与「本次 token 数」。
 	//
 	// 为什么保留原始样本而不是只留累加值：上游 usage_summary.consumed_amount 是
@@ -53,6 +66,14 @@ type ModelStat struct {
 	// 派生指标（序列化给前端用，落盘时忽略）
 	CacheRatePct      float64 `json:"cache_rate_pct"`
 	CreditsPerMillion float64 `json:"credits_per_million"`
+	// AvgTPS 加权吞吐（tokens/秒）= timed_completion_tokens / gen_ms_sum。
+	// AvgCharPS 是同一口径的字符速率，用来交叉验证：
+	// 若 token 速率正常但字符速率异常低，说明瓶颈在我们下发而非上游生成。
+	AvgTPS     float64 `json:"avg_tps"`
+	AvgCharPS  float64 `json:"avg_char_ps"`
+	AvgGenMs   float64 `json:"avg_gen_ms"`
+	AvgTTFTMs  float64 `json:"avg_ttft_ms"`
+	AvgUpTTFMs float64 `json:"avg_upstream_ttft_ms"`
 }
 
 // Delta 一次请求的用量增量。
@@ -130,6 +151,35 @@ func (t *Tracker) Add(d Delta) {
 	t.dirty = true
 }
 
+// AddTiming 记录一次流式请求的耗时快照（吞吐聚合用）。
+//
+// 由调用方在流结束后调用一次；completionTokens 与 genMs 必须来自**同一个**
+// 请求，否则加权吞吐会失真。genMs<=0（例如只收到 1 帧）直接丢弃样本。
+func (t *Tracker) AddTiming(model string, completionTokens, genMs, ttftMs, upstreamTTFMs, chars int64) {
+	if model == "" || genMs <= 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m := t.modelLocked(model)
+	m.TimingSamples++
+	m.GenMsSum += genMs
+	if completionTokens > 0 {
+		m.TimedCompletionTok += completionTokens
+	}
+	if ttftMs > 0 {
+		m.TTFTMsSum += ttftMs
+	}
+	if upstreamTTFMs > 0 {
+		m.UpstreamTTFMsSum += upstreamTTFMs
+	}
+	if chars > 0 {
+		m.CharsSum += chars
+	}
+	t.updated = time.Now()
+	t.dirty = true
+}
+
 // AddCreditSample 记录一次窗口分摊结果（credits 为该模型在本窗口分摊到的积分，
 // tokens 为该模型在本窗口的 token 数）。分子分母同源同窗口，比值无偏。
 func (t *Tracker) AddCreditSample(model string, credits float64, tokens int64) {
@@ -168,6 +218,8 @@ func (t *Tracker) Snapshot() Snapshot {
 		cp := *m
 		cp.CacheRatePct = cacheRatePct(cp.CacheReadTokens, cp.PromptTokens)
 		cp.CreditsPerMillion = medianOf(cp.Samples)
+		cp.AvgTPS, cp.AvgCharPS, cp.AvgGenMs, cp.AvgTTFTMs, cp.AvgUpTTFMs = timingDerived(
+			cp.TimedCompletionTok, cp.CharsSum, cp.GenMsSum, cp.TTFTMsSum, cp.UpstreamTTFMsSum, cp.TimingSamples)
 		out = append(out, cp)
 		totals.Requests += cp.Requests
 		totals.PromptTokens += cp.PromptTokens
@@ -175,6 +227,12 @@ func (t *Tracker) Snapshot() Snapshot {
 		totals.TotalTokens += cp.TotalTokens
 		totals.CacheReadTokens += cp.CacheReadTokens
 		totals.ReasoningTokens += cp.ReasoningTokens
+		totals.TimingSamples += cp.TimingSamples
+		totals.GenMsSum += cp.GenMsSum
+		totals.TTFTMsSum += cp.TTFTMsSum
+		totals.UpstreamTTFMsSum += cp.UpstreamTTFMsSum
+		totals.TimedCompletionTok += cp.TimedCompletionTok
+		totals.CharsSum += cp.CharsSum
 		totals.CreditSamples += cp.CreditSamples
 		totals.SampledCredits += cp.SampledCredits
 		totals.SampledTokens += cp.SampledTokens
@@ -196,6 +254,9 @@ func (t *Tracker) Snapshot() Snapshot {
 	})
 	totals.Model = "全部模型"
 	totals.CacheRatePct = cacheRatePct(totals.CacheReadTokens, totals.PromptTokens)
+	// 整体吞吐同样是加权口径（总 token / 总生成时长），跨模型可比。
+	totals.AvgTPS, totals.AvgCharPS, totals.AvgGenMs, totals.AvgTTFTMs, totals.AvgUpTTFMs = timingDerived(
+		totals.TimedCompletionTok, totals.CharsSum, totals.GenMsSum, totals.TTFTMsSum, totals.UpstreamTTFMsSum, totals.TimingSamples)
 	// 整体积分/百万 token 用「加权」口径：总积分 / 总 token。
 	// 不能对各模型的样本混在一起取中位数——不同模型的单价差异很大，
 	// 混合中位数会给出一个谁都不对应的数字。
@@ -211,6 +272,28 @@ func (t *Tracker) Snapshot() Snapshot {
 		Totals:                    totals,
 		CreditSamplingIntervalSec: int64(t.sampleIv / time.Second),
 	}
+}
+
+// timingDerived 把累加量折算成派生指标。
+//
+// TPS 用「总 token / 总生成时长」而不是「各请求 TPS 的算术平均」：
+// 后者会让一条 1 秒吐 5 token 的短请求和一条 60 秒吐 3000 token 的长请求
+// 权重相同，最后得出一个既不代表长请求也不代表短请求的数。
+func timingDerived(completionTok, chars, genMsSum, ttftSum, upTTFSum, samples int64) (tps, charPS, avgGenMs, avgTTFTMs, avgUpTTFMs float64) {
+	if samples <= 0 || genMsSum <= 0 {
+		return 0, 0, 0, 0, 0
+	}
+	secs := float64(genMsSum) / 1000.0
+	if completionTok > 0 {
+		tps = float64(completionTok) / secs
+	}
+	if chars > 0 {
+		charPS = float64(chars) / secs
+	}
+	avgGenMs = float64(genMsSum) / float64(samples)
+	avgTTFTMs = float64(ttftSum) / float64(samples)
+	avgUpTTFMs = float64(upTTFSum) / float64(samples)
+	return
 }
 
 // cacheRatePct 缓存命中率 = cache_read / prompt。prompt 为上游给的输入 token 总数
@@ -312,6 +395,7 @@ func (t *Tracker) Flush() error {
 		cp := *m
 		cp.CacheRatePct = 0      // 派生指标不落盘
 		cp.CreditsPerMillion = 0 // 同上，读回后按原始量重算
+		cp.AvgTPS, cp.AvgCharPS, cp.AvgGenMs, cp.AvgTTFTMs, cp.AvgUpTTFMs = 0, 0, 0, 0, 0
 		doc.Models[name] = cp
 	}
 	t.dirty = false

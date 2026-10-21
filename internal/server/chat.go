@@ -285,7 +285,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 流式耗时拆解落进请求流水：面板据此区分「上游慢」与「我们慢」。
 			// 必须在 Run 返回后取快照（它已停止更新）；此时 rec 的 usage 字段
 			// 也已由 OnUsage 回填，可以算 TPS。
-			applyStreamStats(rec, sse.Stats())
+			st := sse.Stats()
+			applyStreamStats(rec, st)
+			// 按模型聚合吞吐：与请求流水用同一个快照，口径完全一致。
+			// 放在 Run 返回后（此时 OnUsage 已回填 completion_tokens），
+			// 因此分子分母来自同一个请求。
+			if h.cfg.Usage != nil && st.HasTiming {
+				h.cfg.Usage.AddTiming(configName, rec.CompletionTokens, st.GenMs,
+					st.FirstTextMs, st.FirstFrameMs, int64(st.ContentChars+st.ThinkChars))
+			}
 			switch {
 			case err != nil && r.Context().Err() != nil:
 				// 客户端主动断连（用户关闭/取消）：不算上游失败，也不罚号。

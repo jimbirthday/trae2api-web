@@ -50,6 +50,8 @@ func (h *Handler) adminUsage(w http.ResponseWriter, r *http.Request) {
 		sort.SliceStable(models, func(i, j int) bool { return models[i].CacheRatePct > models[j].CacheRatePct })
 	case "credits":
 		sort.SliceStable(models, func(i, j int) bool { return models[i].CreditsPerMillion > models[j].CreditsPerMillion })
+	case "tps":
+		sort.SliceStable(models, func(i, j int) bool { return models[i].AvgTPS > models[j].AvgTPS })
 	case "model":
 		sort.SliceStable(models, func(i, j int) bool { return models[i].Model < models[j].Model })
 	}

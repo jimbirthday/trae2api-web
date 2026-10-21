@@ -249,3 +249,45 @@ func TestTotalsCreditsPerMillionIsWeighted(t *testing.T) {
 			s.Totals.CreditsPerMillion, s.Totals.Samples)
 	}
 }
+
+// 吞吐聚合必须是「总 token / 总生成时长」的加权口径，不能是各请求 TPS 的算术平均：
+// 一条 1s 吐 10 token（10 tok/s）和一条 20s 吐 1000 token（50 tok/s）
+// 加权后应是 1010/21 ≈ 48.1，而不是 (10+50)/2 = 30。
+func TestTimingAggregationIsWeighted(t *testing.T) {
+	tr := New("", time.Minute)
+	defer tr.Close()
+	tr.AddTiming("m", 10, 1000, 300, 250, 20)
+	tr.AddTiming("m", 1000, 20000, 800, 800, 4000)
+	// 无效样本：没有生成时长，必须被丢弃（不能拉低均值）
+	tr.AddTiming("m", 500, 0, 100, 100, 500)
+
+	s := tr.Snapshot()
+	m := s.Models[0]
+	if m.TimingSamples != 2 {
+		t.Fatalf("timing samples=%d want 2", m.TimingSamples)
+	}
+	want := 1010.0 / 21.0
+	if diff := m.AvgTPS - want; diff > 1e-9 || diff < -1e-9 {
+		t.Fatalf("avg_tps=%.4f want %.4f", m.AvgTPS, want)
+	}
+	if m.AvgGenMs != 10500 {
+		t.Fatalf("avg_gen_ms=%.1f want 10500", m.AvgGenMs)
+	}
+	if m.AvgTTFTMs != 550 {
+		t.Fatalf("avg_ttft_ms=%.1f want 550", m.AvgTTFTMs)
+	}
+	if m.AvgCharPS != 4020.0/21.0 {
+		t.Fatalf("avg_char_ps=%.4f want %.4f", m.AvgCharPS, 4020.0/21.0)
+	}
+	// 合计行与单模型一致（只有一个模型）
+	if s.Totals.AvgTPS != m.AvgTPS {
+		t.Fatalf("totals avg_tps=%.4f want %.4f", s.Totals.AvgTPS, m.AvgTPS)
+	}
+	// 没有任何计时样本时，派生指标必须是 0（前端显示 "-"），不能凭空造数
+	tr2 := New("", time.Minute)
+	defer tr2.Close()
+	tr2.Add(Delta{Model: "m", PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15})
+	if got := tr2.Snapshot().Models[0].AvgTPS; got != 0 {
+		t.Fatalf("avg_tps with no samples=%v want 0", got)
+	}
+}
