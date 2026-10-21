@@ -4,6 +4,7 @@
   "callback_bind": "0.0.0.0",
   "public_base_url": "",
   "cors_origins": [],
+  "model_aliases": {},
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "default_model": "glm-5.2",

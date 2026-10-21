@@ -318,10 +318,15 @@ N 个账号就是 2N 次上游调用。改前「切 tab 就全量重查」，5 �
 | 方法 | 路径 | 鉴权 | 说明 |
 |---|---|---|---|
 | POST | `/v1/chat/completions` | Bearer | 对话补全，支持 `stream: true` |
-| GET | `/v1/models` | Bearer | 模型列表（静态兜底表 + 上游动态列表合并） |
+| POST | `/v1/completions` | Bearer | legacy 文本补全（见下文「兼容端点」） |
+| POST | `/v1/responses` | Bearer | Responses API（最小可用子集，支持流式事件） |
+| POST | `/v1/embeddings` | Bearer | 明确返回 **501**（上游无 embedding 能力） |
+| GET | `/v1/models` | Bearer | 模型列表（静态兜底表 + 上游动态列表 + 别名） |
 | GET | `/v1/models/{id}` | Bearer | 单个模型详情；不存在返回 OpenAI 风格 404 |
 | OPTIONS | `/v1/*` | — | CORS 预检，直接返回 204 |
-| GET | `/healthz` | — | 健康检查（容器 healthcheck 用） |
+| GET | `/metrics` | **无** | Prometheus 指标（见「监控指标」） |
+| GET | `/healthz` | — | 存活探针（容器 healthcheck 用）。只看进程是否活着，**不**受账号状态影响 |
+| GET | `/readyz` | — | 就绪探针。无可用账号时返回 503，供 LB/反代摘流 |
 | GET | `/status` | Bearer | 账号池运行状态 |
 | GET | `/admin` | 面板口令/cookie | Web 控制台 |
 
@@ -361,6 +366,98 @@ OpenAI 原生行为，它只是为了照顾不识别 `reasoning_content` 的客�
 流内错误同样用标准格式：`data: {"error":{"message":…,"type":…,"code":…}}` + `data: [DONE]`，
 不使用非标准的 `event: error`（客户端不会把它当错误处理，流会无声断掉）。
 
+### 兼容端点
+
+三个端点都是**协议翻译层**，最终都复用 `/v1/chat/completions` 的业务内核
+（选号、换号、冷却、usage 记账、请求流水），因此行为与主端点完全一致。
+
+**`POST /v1/completions`（legacy）**
+
+```bash
+curl -s http://127.0.0.1:8000/v1/completions \
+  -H "Authorization: Bearer $TW2A_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.2","prompt":"只回答一个数字：2+2=?","max_tokens":32}'
+```
+
+- `prompt` 支持 `string` 与 `[]string`（批量，最多 8 条，合并成一个 `choices` 数组，`index` 递增）。
+- `prompt` 为 `[]int`（token ids）时**明确 400**：本服务没有分词器，按字符串转发只会得到乱码。
+- `stream: true` 时把 chat 帧翻译成 `text_completion` 帧，末帧 `finish_reason:"stop"` + `[DONE]`。
+  批量 + 流式组合不支持（会只回第一条 prompt 的结果，比报错更难排查）。
+- `echo` / `suffix` / `best_of` / `logprobs` 等字段被忽略，并在日志里记录字段名。
+
+**`POST /v1/responses`**
+
+```bash
+curl -s http://127.0.0.1:8000/v1/responses \
+  -H "Authorization: Bearer $TW2A_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"glm-5.2","input":"只回答一个数字：3+3=?","max_output_tokens":32}'
+```
+
+- `instructions` → `system` message；`input` 可以是字符串或消息数组
+  （`content` 里的 `input_text` / `text` 分片会被展开成纯文本；图片/文件类分片明确 400）。
+- 非流式返回 `output[]` + `output_text` 便捷字段；思考内容作为 `reasoning` item 排在 message 之前。
+- 流式发出 `response.created` → `response.output_text.delta` → `response.completed` 等事件，
+  **不发 `[DONE]`**（Responses 规范不使用它）。
+- `previous_response_id` / `tools` / `tool_choice` 未实现，会被忽略并记录日志。
+
+**`POST /v1/embeddings`** 返回 501 而不是 404：404 会让人以为路径写错了。
+
+### 模型别名
+
+把客户端里的模型名映射到上游 `config_name`，不需要改客户端配置：
+
+```bash
+# 方式一：环境变量（逗号分隔）
+TW2A_MODEL_ALIASES="gpt-4o=glm-5.2,fast=kimi-k3"
+# 方式二：config.json
+{"model_aliases": {"gpt-4o": "glm-5.2"}}
+# 方式三：面板「用量统计 → 模型别名」直接编辑（立即生效，写回 config.json）
+```
+
+三条规则（都是为了避免「配了却悄悄改坏请求」）：
+
+1. **只做一级映射**，不递归。`a=b`、`b=c` 时传 `a` 只会解析成 `b`，不会连跳到 `c`（也顺带杜绝了环）。
+2. **静态模型优先**：客户端传的名字若本身就是真实模型 id（如 `glm-5.2`），别名不生效。
+3. **响应里的 `model` 始终回显客户端传的原始名**，不会被替换成上游模型名。
+
+别名会出现在 `/v1/models` 里（`owned_by: "alias"`），便于客户端下拉选择。
+
+### 监控指标
+
+`GET /metrics` 输出 Prometheus 文本格式（`text/plain; version=0.0.4`），无需鉴权：
+
+```bash
+curl -s http://127.0.0.1:8000/metrics | grep trae2web_
+```
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `trae2web_up` | gauge | 恒 1，存活探测 |
+| `trae2web_uptime_seconds` | gauge | 进程运行时长 |
+| `trae2web_accounts{state=…}` | gauge | `total` / `healthy` / `cooling` / `disabled` / `below_floor` |
+| `trae2web_in_flight` | gauge | 进行中请求数 |
+| `trae2web_requests_total{outcome=…}` | counter | `success` / `failure` / `client_error` / `canceled` |
+| `trae2web_request_duration_ms_avg` / `trae2web_success_rate` | gauge | 平均耗时 / 成功率（0..1） |
+| `trae2web_rotations_total` | counter | 换号次数 |
+| `trae2web_tokens_total{kind=…}` | counter | `prompt` / `completion` / `total` |
+| `trae2web_model_requests_total{model=…}` | counter | 按模型请求数 |
+| `trae2web_model_tokens_total{model=…,kind=…}` | counter | 按模型 token（含 `cache_read`） |
+| `trae2web_model_tps{model=…}` | gauge | 加权吞吐（completion_tokens ÷ 生成时长） |
+| `trae2web_model_ttft_ms_avg{model=…}` | gauge | 平均首字耗时 |
+| `trae2web_sticky_sessions` | gauge | 粘性会话绑定数 |
+| `trae2web_archive_write_dropped_total` | counter | 归档写入被丢弃次数（队列满不阻塞业务） |
+
+所有数据来自内存计数与快照，不读文件、不打上游，单次抓取在毫秒级。
+
+> **`/metrics` 刻意不鉴权**：Prometheus 的 `scrape_config` 不便携带自定义头，
+> 业界惯例也是匿名抓取。代价是指标会暴露账号数量与流量规模，
+> **生产环境必须用反向代理做 IP 白名单**（如 nginx `allow 10.0.0.0/8; deny all;`），
+> 或只在内网暴露该路径。
+
+### 账号池运行状态
+
+`GET /status`（Bearer）返回账号列表、状态计数、粘性会话数与默认模型，供脚本巡检。
+
 ## 配置项参考
 
 除 `upstream.model_error_rules`（模型级错误规则表，只能写 `config.json`）外，
@@ -383,6 +480,7 @@ OpenAI 原生行为，它只是为了照顾不识别 `reasoning_content` 的客�
 | `TW2A_CALLBACK_PUBLISH` | `18080` | （仅 docker compose）回调端口映射到宿主的端口 |
 | `TW2A_PUBLIC_BASE_URL` | (空) | 公网基址，如 `https://trae.example.com`。非空时回调链接为 `<该值>/authorize`，**Docker 生产部署推荐** |
 | `TW2A_CORS_ORIGINS` | (空 = `*`) | `/v1/*` 允许的跨域来源，逗号分隔 |
+| `TW2A_MODEL_ALIASES` | (空) | 模型别名，逗号分隔的 `别名=真实模型`（仅一级映射，见「模型别名」）；等价于 `config.json` 的 `model_aliases` |
 
 ### 存储与日志
 

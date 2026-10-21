@@ -254,3 +254,32 @@ func TestChatReusesClientRequestID(t *testing.T) {
 		t.Fatalf("X-Request-ID=%q want client-trace-42", got)
 	}
 }
+
+// 上游返回「只有 role 帧、没有正文」的流 → 必须判失败，绝不能记成 success。
+// 这是审计里的高危项：伪成功会让客户端以为拿到了空答案，且坏号被粘性钉死。
+func TestEmptyStreamRecordedAsFailure(t *testing.T) {
+	const emptySSE = "event: metadata\ndata: {\"model\":\"glm-5.2\"}\n\n"
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, emptySSE, true })
+	rl := reqlog.New(reqlog.Config{})
+	defer rl.Close()
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream:   up,
+		RequestLog: rl,
+		MaxRotate:  1,
+	})
+	body := `{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	evs := rl.Recent(5)
+	if len(evs) == 0 {
+		t.Fatal("no request recorded")
+	}
+	if evs[0].Outcome == reqlog.OutcomeSuccess {
+		t.Fatalf("empty stream recorded as success: %+v", evs[0])
+	}
+	if evs[0].TPS != 0 {
+		t.Errorf("empty stream must not contribute a TPS sample, got %v", evs[0].TPS)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +54,11 @@ type Config struct {
 	// CORSOrigins 允许跨域访问 /v1/* 的来源列表；空 = "*"。
 	// 本服务用 Bearer 鉴权、不用 cookie，因此不需要 Allow-Credentials。
 	CORSOrigins []string
+	// ModelAliases 客户端模型名 → 上游 config_name 的别名表（nil = 无别名）。
+	//
+	// 只做**一级**映射，不递归；且客户端传的名字若是合法静态模型 id 则不生效
+	// （避免把真实模型名误改写成别的）。详见 alias.go 的 resolveModelAlias。
+	ModelAliases map[string]string
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -81,6 +87,9 @@ type Handler struct {
 	modelsFail    time.Time
 	modelsLoading chan struct{} // non-nil = 有 goroutine 正在拉取（singleflight）
 
+	// 模型别名的运行时读写锁（面板保存后热更新，见 alias.go）。
+	aliasesMu sync.RWMutex
+
 	// 面板登录爆破限流（按来源 IP 计数）。
 	loginLimiter loginLimiter
 }
@@ -108,12 +117,41 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.DefaultModel == "" {
 		cfg.DefaultModel = upstream.DefaultConfigName
 	}
+	// 别名为空时依次回落到 config.json 的 model_aliases、TW2A_MODEL_ALIASES。
+	// 三条来源汇成同一个 map，优先级见 alias.go 文件尾注释。
+	if len(cfg.ModelAliases) == 0 {
+		cfg.ModelAliases = loadModelAliasesConfig(cfg.ConfigPath)
+	}
+	// 面板保存的兜底副本（Docker 下 config.json 常常没挂载，只有这里能活过重建）。
+	if len(cfg.ModelAliases) == 0 {
+		cfg.ModelAliases = loadModelAliasesStore(aliasStorePathFor(cfg.ConfigPath))
+	}
+	if len(cfg.ModelAliases) == 0 {
+		cfg.ModelAliases = loadModelAliasesEnv()
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), logins: map[string]*pendingLogin{}}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /v1/models/{id}", h.withAuth(h.modelByID))
+	// 兼容面补齐（见 compat.go）：老版 text completion、新版 Responses API、
+	// 以及明确「不支持」的 embeddings。三者都复用 chatCompletions 的业务内核。
+	h.mux.HandleFunc("POST /v1/completions", h.withAuth(h.legacyCompletions))
+	h.mux.HandleFunc("POST /v1/responses", h.withAuth(h.responses))
+	// embeddings 上游没有：返回 501 而不是 404，让调用方明确知道「不是路径错」。
+	h.mux.HandleFunc("POST /v1/embeddings", h.withAuth(h.embeddingsUnsupported))
+	// Prometheus 抓取端点：刻意不鉴权（scrape_config 不便带自定义头），
+	// 生产需用反向代理做 IP 白名单。详见 metrics.go 文件头注释。
+	h.mux.HandleFunc("GET /metrics", h.metrics)
+	// 模型别名：GET 查看、POST 保存（写 config.json 并立即生效）。
+	h.mux.HandleFunc("GET /admin/api/aliases", h.adminReadAuth(h.adminAliases))
+	h.mux.HandleFunc("POST /admin/api/aliases", h.withAdminAuth(h.adminAliases))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	// readiness 与 liveness 必须分开：
+	//   /healthz 只回答「进程还活着」，用于容器重启判定——账号全挂了也不该重启进程；
+	//   /readyz  回答「现在能不能接流量」，用于 LB/反代摘流——没有可用账号时
+	//            继续把请求分进来只会让用户拿到 503，不如干脆摘掉。
+	h.mux.HandleFunc("GET /readyz", h.readyz)
 	// 管理面板：本地面板
 	// 读接口无鉴权（局域网内只读）；写接口（accounts 写/login/refresh/authorize）
 	// 经 withAdminAuth 校验 Bearer = TW2A_API_KEY（见 §4 安全设计）。
@@ -273,6 +311,28 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte("ok"))
 }
 
+// readyz 就绪探针：至少有一个可路由账号才算 ready。
+//
+// 为什么不用 /healthz 兼任：容器编排用 liveness 决定「重启」，而「所有账号
+// 都在冷却」是运行期正常状态（等冷却结束即可自愈），重启进程毫无帮助且会
+// 丢掉内存里的冷却计时。所以两者必须是不同语义、不同消费者。
+//
+// 返回 503 时带上可诊断的计数，避免运维只能看到「不 ready」却不知为何。
+func (h *Handler) readyz(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Pool == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ready": false, "reason": "pool not configured"})
+		return
+	}
+	cnt := h.cfg.Pool.Counts()
+	if cnt.Healthy <= 0 {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ready": false, "reason": "no routable account", "counts": cnt,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ready": true, "healthy": cnt.Healthy})
+}
+
 func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	counts := h.cfg.Pool.Counts()
 	sessionCount := 0
@@ -304,6 +364,10 @@ func (h *Handler) mapModel(model string) (string, error) {
 	if model == "" || model == "auto" {
 		return h.cfg.DefaultModel, nil
 	}
+	// 别名一级映射：clientModel → alias → 下面照常走静态/动态表 → configName。
+	// 放在 mapModel 内部而不是调用点，是为了让「所有入口」都自动获得别名能力
+	// （chat / completions / responses 共三条路径，漏一处就会出现行为不一致）。
+	model = h.resolveModelAlias(model)
 	// 去掉内部名后缀（__dev / __max 等）
 	base := model
 	if i := strings.Index(model, "__"); i >= 0 {
@@ -449,6 +513,45 @@ func (h *Handler) modelByID(w http.ResponseWriter, r *http.Request) {
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
 func (h *Handler) modelList() []map[string]any {
+	return h.withAliases(h.baseModelList())
+}
+
+// withAliases 把别名作为额外的模型条目追加到 /v1/models。
+//
+// 为什么必须加：绝大多数客户端（LibreChat / OpenWebUI / Cline）只允许
+// 从 /v1/models 的返回值里选模型。别名不在列表里，用户就「看得到却选不了」，
+// 只能手填——那等于别名白配。owned_by 标成 alias，便于和真实模型区分。
+func (h *Handler) withAliases(list []map[string]any) []map[string]any {
+	aliases := h.aliasesSnapshot()
+	if len(aliases) == 0 {
+		return list
+	}
+	have := make(map[string]bool, len(list))
+	for _, m := range list {
+		if id, ok := m["id"].(string); ok {
+			have[id] = true
+		}
+	}
+	names := make([]string, 0, len(aliases))
+	for k := range aliases {
+		names = append(names, k)
+	}
+	sort.Strings(names) // 稳定顺序，避免每次请求列表抖动
+	out := append([]map[string]any{}, list...)
+	for _, k := range names {
+		if have[k] {
+			continue
+		}
+		out = append(out, map[string]any{
+			"id": k, "object": "model", "created": 1753600000,
+			"owned_by": "alias", "context_length": 131072,
+		})
+	}
+	return out
+}
+
+// baseModelList 未叠加别名的原始模型表。
+func (h *Handler) baseModelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {

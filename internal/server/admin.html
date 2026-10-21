@@ -227,6 +227,24 @@
     <div class="grid" id="usageKpi" style="margin-bottom:14px"></div>
     <div id="usageTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
     <div id="pgUsage" class="pager"></div>
+
+    <div class="card" style="margin-top:18px">
+      <h2>模型别名</h2>
+      <div style="color:var(--dim);font-size:11px;margin:6px 0 10px;line-height:1.7">
+        每行一条 <code>别名=真实模型</code>，例如 <code>gpt-4o=glm-5.2</code>。
+        只做<b>一级映射</b>（不递归），且若客户端传的名字本身就是真实模型 id 则不生效——
+        避免把显式指定的模型偷偷改掉。别名会出现在 <code>/v1/models</code> 里，客户端可直接选。
+      </div>
+      <textarea id="aliasBox" rows="6" spellcheck="false"
+        style="width:100%;background:var(--card2);color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;
+               padding:9px 11px;font-family:Consolas,monospace;font-size:12px;resize:vertical"
+        placeholder="gpt-4o=glm-5.2&#10;fast=kimi-k3"></textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <button class="btn primary" id="aliasSave">保存别名</button>
+        <button class="btn" id="aliasReload">重新载入</button>
+        <span id="aliasStatus" class="login-status" style="display:none"></span>
+      </div>
+    </div>
   </div>
 
   <!-- 额度监控 -->
@@ -429,7 +447,7 @@ function switchTab(name, el){
 function refreshActive(force){
   if(activeTab==='accounts') loadAccounts(force);
   else if(activeTab==='credits') loadCredits(!!force); // 切 tab 走缓存，点刷新才打上游
-  else if(activeTab==='usage') loadUsage(force);
+  else if(activeTab==='usage'){ loadUsage(force); loadAliases(); }
   else loadRequests(false);
 }
 
@@ -661,6 +679,59 @@ function gotoUsage(page, pageSize){
     if(th) sortUsage(th.dataset.sort);
   });
 })();
+/* 模型别名：面板读写（GET /admin/api/aliases，POST 同路径）。
+   失败时把后端错误原文显示出来（它是可读的中文校验信息），不要吞掉。 */
+function aliasesToText(m){
+  return Object.keys(m||{}).sort().map(k=>k+'='+m[k]).join('\n');
+}
+function textToAliases(text){
+  const out = {};
+  for(const raw of (text||'').split('\n')){
+    const line = raw.trim();
+    if(!line) continue;
+    const i = line.indexOf('=');
+    if(i <= 0) continue;
+    out[line.slice(0,i).trim()] = line.slice(i+1).trim();
+  }
+  return out;
+}
+async function loadAliases(){
+  const box = document.getElementById('aliasBox');
+  const st = document.getElementById('aliasStatus');
+  if(!box) return;
+  try{
+    const d = await apiGet('/admin/api/aliases', 'usage', 3000);
+    box.value = aliasesToText(d.aliases);
+    st.style.display='none';
+  }catch(e){
+    if(e.name === 'AbortError') return;
+    st.style.display=''; st.className='login-status err'; st.textContent='载入失败：'+e.message;
+  }
+}
+async function saveAliases(){
+  const box = document.getElementById('aliasBox');
+  const st = document.getElementById('aliasStatus');
+  const btn = document.getElementById('aliasSave');
+  btn.disabled = true;
+  try{
+    const r = await fetch('/admin/api/aliases', {
+      method:'POST', headers:{'Content-Type':'application/json', ...authHeader()},
+      body: JSON.stringify({aliases: textToAliases(box.value)})
+    });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(apiErr(d));
+    box.value = aliasesToText(d.aliases);
+    invalidate('/admin/api/aliases');
+    st.style.display=''; st.className='login-status ok';
+    st.textContent='已保存（立即生效）';
+  }catch(e){
+    st.style.display=''; st.className='login-status err'; st.textContent='保存失败：'+e.message;
+  }finally{
+    btn.disabled = false;
+  }
+}
+document.getElementById('aliasSave').addEventListener('click', saveAliases);
+document.getElementById('aliasReload').addEventListener('click', loadAliases);
 function sortUsage(key){
   usageState.sort = key;
   usageState.page = 1;
