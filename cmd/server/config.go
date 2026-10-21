@@ -50,7 +50,7 @@ type Config struct {
 		Enabled    bool   `json:"enabled"`     // 请求流水归档（默认 true）
 		Dir        string `json:"dir"`         // "./data/logs"
 		FileMaxMB  int    `json:"file_max_mb"` // 单文件上限（默认 16）
-		RetainDays int    `json:"retain_days"` // 保留天数（默认 7）
+		RetainDays int    `json:"retain_days"` // 保留天数（默认 3）
 	} `json:"reqlog"`
 
 	Stream struct {
@@ -148,7 +148,7 @@ func Default() *Config {
 	c.ReqLog.Enabled = true
 	c.ReqLog.Dir = "./data/logs"
 	c.ReqLog.FileMaxMB = 16
-	c.ReqLog.RetainDays = 7
+	c.ReqLog.RetainDays = 3
 
 	c.Stream.Thinking = StreamThinkingReasoning
 	c.Stream.Heartbeat = "1s"
@@ -392,7 +392,7 @@ func (c *Config) normalize() error {
 		c.ReqLog.FileMaxMB = 16
 	}
 	if c.ReqLog.RetainDays <= 0 {
-		c.ReqLog.RetainDays = 7
+		c.ReqLog.RetainDays = 3
 	}
 	// 模型级错误规则校验：kind 必须非空，否则该条无效（宁可不触发也不要误判）。
 	for i := range c.Upstream.ModelErrorRules {

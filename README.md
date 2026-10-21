@@ -215,7 +215,7 @@ TRAE 是无状态全量上下文，粘性不解决上下文拼接，但能避免
 ### 请求流水
 
 `reqlog` 记录每请求的 uid / 模型 / 状态 / 结果 / 延迟 / tokens / 换号次数，
-内存保留最近 512 条，可选按天归档到 `data/logs/requests-YYYYMMDD-N.jsonl`（默认 16MiB/文件、保留 7 天）。
+内存保留最近 512 条，可选按天归档到 `data/logs/requests-YYYYMMDD-N.jsonl`（默认 16MiB/文件、保留 3 天）。
 面板「请求流水」页可按 uid / 模型 / 结果过滤并分页。**不记录提示词、响应正文与凭证。**
 
 归档读取走**文件尾部倒读**（按 64KiB 块从末尾往前扫，凑够一页就停），不再整文件解析；
@@ -275,7 +275,7 @@ N 个账号就是 2N 次上游调用。改前「切 tab 就全量重查」，5 �
 | `TW2A_SESSION_TTL` | `30m` | 会话绑定 TTL |
 | `TW2A_REQLOG_ENABLED` | `true` | 是否记录请求流水 |
 | `TW2A_REQLOG_DIR` | `./data/logs` | 请求流水归档目录 |
-| `TW2A_REQLOG_RETAIN_DAYS` | `7` | 归档保留天数 |
+| `TW2A_REQLOG_RETAIN_DAYS` | `3` | 归档保留天数（含当天，小时级自动清理） |
 | `TW2A_STREAM_THINKING` | `content` | 思考内容呈现：`reasoning`（走 `reasoning_content`）/ `content`（包 `think` 标签当正文，空档期立刻有字）/ `none`（丢弃） |
 | `TW2A_STREAM_HEARTBEAT` | `1s` | 空闲保活间隔（上游静默时写 SSE 注释，防代理掐断）；`0`/`off` 关闭 |
 | `TW2A_USAGE_ENABLED` | `true` | 是否统计按模型用量（token/缓存/积分采样） |

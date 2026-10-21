@@ -33,7 +33,9 @@ const (
 	// defaultQueue 归档写队列默认深度。
 	defaultQueue = 1024
 	// defaultRetainDays 归档默认保留天数。
-	defaultRetainDays = 7
+	defaultRetainDays = 3
+	// cleanupInterval 归档清理检查间隔。
+	cleanupInterval = time.Hour
 )
 
 // Outcome 取值（面板与指标按此分类统计）。
@@ -583,10 +585,16 @@ func (a *archive) noteDropped() { a.dropCount.Add(1) }
 
 func (a *archive) run() {
 	defer a.wg.Done()
+	// 清理节拍：每小时检查一次。按天轮转 + 保留 3 天，一小时精度足够，
+	// 也不会因为文件少而白扫目录。
+	tick := time.NewTicker(cleanupInterval)
+	defer tick.Stop()
 	for {
 		select {
 		case e := <-a.queue:
 			a.write(e)
+		case <-tick.C:
+			a.cleanup()
 		case <-a.done:
 			// 关停时把队列里剩下的写完（有界，不会无限等待）。
 			for {
@@ -672,12 +680,22 @@ func (a *archive) setErr(err error) {
 }
 
 // cleanup 删除超过保留天数的归档文件。
+//
+// 保留 N 天 = 保留「今天在内最近 N 个自然日」的文件。因此截止日取 N-1 天前，
+// 不能取 N 天前（那样实际会留下 N+1 天的数据）。
+//
+// 由 run() 里的 ticker 每小时触发一次：只在启动时清一次是不够的——容器连续
+// 跑几天不重启，日志就会一直涨。
 func (a *archive) cleanup() {
 	entries, err := os.ReadDir(a.cfg.Dir)
 	if err != nil {
 		return
 	}
-	cutoff := time.Now().AddDate(0, 0, -a.cfg.RetainDays).Format("20060102")
+	retain := a.cfg.RetainDays
+	if retain <= 0 {
+		retain = defaultRetainDays
+	}
+	cutoff := time.Now().AddDate(0, 0, -(retain - 1)).Format("20060102")
 	for _, ent := range entries {
 		name := ent.Name()
 		if !strings.HasPrefix(name, "requests-") || !strings.HasSuffix(name, ".jsonl") {
@@ -687,10 +705,25 @@ func (a *archive) cleanup() {
 		if len(day) < 8 {
 			continue
 		}
-		if day[:8] < cutoff {
-			_ = os.Remove(filepath.Join(a.cfg.Dir, name))
+		if day[:8] >= cutoff {
+			continue
+		}
+		path := filepath.Join(a.cfg.Dir, name)
+		// 正在写的文件不删（理论上不会命中：当前文件一定是今天的）。
+		if a.curPath == path {
+			continue
+		}
+		if err := os.Remove(path); err == nil {
+			a.forgetLines(path)
 		}
 	}
+}
+
+// forgetLines 清掉已删除文件的行数缓存，避免 map 随天数无限增长。
+func (a *archive) forgetLines(path string) {
+	a.cntMu.Lock()
+	delete(a.counts, path)
+	a.cntMu.Unlock()
 }
 
 func (a *archive) listFiles() ([]archiveFile, error) {

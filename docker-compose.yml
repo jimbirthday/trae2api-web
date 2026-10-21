@@ -25,6 +25,14 @@ services:
       - ./data:/app/data
       # 想用宿主 config.json 覆盖默认配置时，取消下一行注释
       # - ./config.json:/app/config.json:ro
+    # 容器 stdout 日志轮转。docker 的 json-file 驱动只能按「大小+份数」限制，
+    # 不支持按天，所以这里用「20MB × 3 份」近似三天量级：本服务 stdout 只有
+    # 启动信息与少量错误，正常一天远达不到 20MB。
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8000/healthz"]
       interval: 30s
