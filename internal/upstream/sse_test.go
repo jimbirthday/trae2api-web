@@ -604,3 +604,58 @@ func TestStreamThinkingNoneDropsReasoning(t *testing.T) {
 		t.Errorf("answer missing")
 	}
 }
+
+// 流式计时：首帧/首字/生成跨度/最大空档必须被采集，且 TPS 用 genMs 做分母。
+func TestStreamTimingStats(t *testing.T) {
+	sse := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"想\"}\n\n" +
+		"event:output\ndata:{\"response\":\"答\",\"reasoning_content\":\"\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	w := NewSSEWriter(rec, "m")
+	defer w.Close()
+	if err := w.Run(strings.NewReader(sse), StreamOptions{Thinking: ThinkingReasoning}); err != nil {
+		t.Fatal(err)
+	}
+	st := w.Stats()
+	if !st.HasTiming {
+		t.Fatal("no timing captured")
+	}
+	if st.Frames != 2 {
+		t.Errorf("frames=%d want 2", st.Frames)
+	}
+	if st.ContentChars != 1 || st.ThinkChars != 1 {
+		t.Errorf("chars: content=%d think=%d", st.ContentChars, st.ThinkChars)
+	}
+	if st.FirstFrameMs < 0 || st.FirstTextMs < 0 || st.GenMs < 0 {
+		t.Errorf("negative timings: %+v", st)
+	}
+	// TPS 必须用 genMs；genMs=0 时不能返回 NaN/Inf
+	if st.GenMs == 0 {
+		if got := st.TPS(100); got != 0 {
+			t.Errorf("TPS with zero genMs should be 0, got %v", got)
+		}
+	}
+	if st.TPS(0) != 0 {
+		t.Error("TPS with zero tokens should be 0")
+	}
+}
+
+// ThinkingNone 丢弃思考时，思考字符不能算进吞吐（否则 TPS 虚高）。
+func TestStreamTimingExcludesDroppedThinking(t *testing.T) {
+	sse := "event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"很长很长的思考\"}\n\n" +
+		"event:output\ndata:{\"response\":\"答\",\"reasoning_content\":\"\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	w := NewSSEWriter(rec, "m")
+	defer w.Close()
+	if err := w.Run(strings.NewReader(sse), StreamOptions{Thinking: ThinkingNone}); err != nil {
+		t.Fatal(err)
+	}
+	st := w.Stats()
+	if st.ThinkChars != 0 {
+		t.Errorf("dropped thinking must not be counted: think=%d", st.ThinkChars)
+	}
+	if st.ContentChars != 1 { // rune 计数，不是字节数
+		t.Errorf("content chars=%d want 1", st.ContentChars)
+	}
+}

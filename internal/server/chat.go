@@ -282,6 +282,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			})
 			rc.Close()
 			h.cfg.Pool.Release(acct.UID)
+			// 流式耗时拆解落进请求流水：面板据此区分「上游慢」与「我们慢」。
+			// 必须在 Run 返回后取快照（它已停止更新）；此时 rec 的 usage 字段
+			// 也已由 OnUsage 回填，可以算 TPS。
+			applyStreamStats(rec, sse.Stats())
 			switch {
 			case err != nil && r.Context().Err() != nil:
 				// 客户端主动断连（用户关闭/取消）：不算上游失败，也不罚号。
@@ -443,6 +447,28 @@ func (h *Handler) noteCreditCompletion(uid, model string, tokens int64) {
 	h.cfg.CreditSampler.NoteCompletion(uid, model, tokens, func(m string, credits float64, tk int64) {
 		h.cfg.Usage.AddCreditSample(m, credits, tk)
 	})
+}
+
+// applyStreamStats 把流式计时快照折算成请求流水字段（含 TPS）。
+//
+// TPS 的分母是 GenMs（首帧→末帧），不是总延迟：
+// 总延迟里含 token 预刷新、建连、上游排队、首包生成，拿它除 token
+// 会系统性低估吞吐，而且这几段的耗时已经由 upstream_ttf_ms 单独体现。
+func applyStreamStats(rec *reqlog.Event, st upstream.StreamStats) {
+	if rec == nil || !st.HasTiming {
+		return
+	}
+	rec.TTFTMs = st.FirstTextMs
+	rec.UpstreamTTFMs = st.FirstFrameMs
+	rec.GenMs = st.GenMs
+	rec.MaxGapMs = st.MaxGapMs
+	rec.TPS = st.TPS(rec.CompletionTokens)
+	// 字符速率用于交叉验证：token 由上游记账，字符是本端实测，
+	// 两者比值异常（如 token 正常但字符速率极低）说明瓶颈在下游写入。
+	if rec.GenMs > 0 {
+		chars := st.ContentChars + st.ThinkChars
+		rec.CharPS = float64(chars) / (float64(rec.GenMs) / 1000.0)
+	}
 }
 
 // recordRequest 落一条请求流水（内存环形 + 可选归档）。

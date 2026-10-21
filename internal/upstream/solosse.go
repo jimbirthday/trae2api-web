@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // SOLOEvent 单条 SOLO SSE 事件（归一化）。
@@ -431,8 +432,109 @@ type SSEWriter struct {
 	thinking  ThinkingMode
 	thinkOpen bool
 
+	// tm 是流式计时采样（首帧/首字/生成跨度/最大空档）。纯整数字段累加，
+	// 每帧只多几次比较，无分配、无额外 goroutine。
+	tm streamTiming
+
 	hbDone chan struct{}
 	hbWG   sync.WaitGroup
+}
+
+// streamTiming 一次流式回复的耗时采样。
+//
+// 存在的意义：只记「总延迟」无法判断慢在哪一段。拆开之后：
+//   - connectMs：建连 + 上游返回响应头（号池/网络/上游排队）
+//   - firstFrameMs：上游开始吐第一帧（上游前置处理 + 首包生成）
+//   - genMs：第一帧到最后一帧（上游解码速度）
+//   - maxGapMs：相邻帧最大间隔（上游卡顿 / 我们写阻塞）
+//
+// TPS 必须用 genMs 做分母，不能用总延迟——总延迟里含思考前的排队与首包，
+// 拿它除 token 数会系统性低估吞吐。
+type streamTiming struct {
+	start      time.Time
+	firstFrame time.Time
+	lastFrame  time.Time
+	firstText  time.Time // 第一次真正向客户端下发正文/思考的时刻
+	maxGap     time.Duration
+	frames     int
+	contentCh  int // 下发的正文字符数
+	thinkCh    int // 下发的思考字符数
+}
+
+// StreamStats 流式计时快照（字段单位：毫秒，除非注明）。
+type StreamStats struct {
+	FirstFrameMs int64 `json:"first_frame_ms"` // 上游首帧
+	FirstTextMs  int64 `json:"first_text_ms"`  // 客户端看到第一个字
+	GenMs        int64 `json:"gen_ms"`         // 首帧→末帧
+	MaxGapMs     int64 `json:"max_gap_ms"`     // 最大帧间隔
+	Frames       int   `json:"frames"`
+	ContentChars int   `json:"content_chars"`
+	ThinkChars   int   `json:"think_chars"`
+	HasTiming    bool  `json:"has_timing"`
+}
+
+// Stats 返回本次流的计时快照。必须在 Run 返回之后调用。
+func (s *SSEWriter) Stats() StreamStats {
+	if s == nil {
+		return StreamStats{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.tm.snapshot()
+}
+
+// snapshot 由 tm 生成对外结构（调用方持锁）。
+func (t *streamTiming) snapshot() StreamStats {
+	if t.start.IsZero() || t.frames == 0 {
+		return StreamStats{}
+	}
+	st := StreamStats{
+		Frames:       t.frames,
+		ContentChars: t.contentCh,
+		ThinkChars:   t.thinkCh,
+		MaxGapMs:     t.maxGap.Milliseconds(),
+		HasTiming:    true,
+	}
+	if !t.firstFrame.IsZero() {
+		st.FirstFrameMs = t.firstFrame.Sub(t.start).Milliseconds()
+		st.GenMs = t.lastFrame.Sub(t.firstFrame).Milliseconds()
+	}
+	if !t.firstText.IsZero() {
+		st.FirstTextMs = t.firstText.Sub(t.start).Milliseconds()
+	}
+	return st
+}
+
+// noteFrame 记录一帧上游输出（在收到 output/plan_item 时调用，持锁）。
+func (t *streamTiming) noteFrame(now time.Time) {
+	if t.start.IsZero() {
+		t.start = now
+	}
+	if t.firstFrame.IsZero() {
+		t.firstFrame = now
+	} else if gap := now.Sub(t.lastFrame); gap > t.maxGap {
+		t.maxGap = gap
+	}
+	t.lastFrame = now
+	t.frames++
+}
+
+// noteText 记录一次真正下发到客户端的正文/思考（持锁）。
+func (t *streamTiming) noteText(now time.Time, contentChars, thinkChars int) {
+	if t.firstText.IsZero() {
+		t.firstText = now
+	}
+	t.contentCh += contentChars
+	t.thinkCh += thinkChars
+}
+
+// TPS 按 token 算吞吐：completion_tokens / 生成时长。
+// tokens<=0 或生成时长为 0 时返回 0（调用方显示 "-"）。
+func (st StreamStats) TPS(completionTokens int64) float64 {
+	if completionTokens <= 0 || st.GenMs <= 0 {
+		return 0
+	}
+	return float64(completionTokens) / (float64(st.GenMs) / 1000.0)
 }
 
 // NewSSEWriter 设置 SSE 响应头、立刻 flush，并写入首个 role 帧。
@@ -444,13 +546,15 @@ func NewSSEWriter(w http.ResponseWriter, model string) *SSEWriter {
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no") // 关 Nginx 缓冲，否则整段回复会攒到最后一次吐出
 
+	now := time.Now()
 	s := &SSEWriter{
 		w:        w,
 		fl:       asFlusher(w),
 		id:       fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
-		created:  time.Now().Unix(),
+		created:  now.Unix(),
 		model:    model,
 		thinking: ThinkingReasoning,
+		tm:       streamTiming{start: now},
 	}
 	// 立刻把响应头刷下去：客户端从「等首字节」变成「等第一个字符」。
 	s.flushLocked()
@@ -650,13 +754,20 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 			switch ev.Event {
 			case "output", "plan_item":
 				s.mu.Lock()
+				s.tm.noteFrame(time.Now())
 				out := s.contentSeen.add(ev.Response)
 				think := s.reasoningSeen.add(ev.Reasoning)
+				// 下发字符数按「实际写给客户端的量」计，而不是上游帧里的原始量：
+				// ThinkingNone 丢弃思考时不能把思考算进吞吐，否则 TPS 会被虚高。
+				// 字符数按 rune 计：中文一个汉字是 3 字节，用 len() 会把吞吐放大 3 倍。
+				nc, nt := utf8.RuneCountInString(out), utf8.RuneCountInString(think)
+				sentC, sentT := 0, 0
 				switch s.thinking {
 				case ThinkingNone:
 					// 丢弃思考，只发正文。
 					if out != "" {
 						s.writeChunk(map[string]any{"content": out}, "")
+						sentC = nc
 					}
 				case ThinkingContent:
 					// 思考当正文发：空档期立刻有字在动，观感就是「边想边说」。
@@ -682,6 +793,8 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 					}
 					if buf.Len() > 0 {
 						s.writeChunk(map[string]any{"content": buf.String()}, "")
+						// think 模式的 content 里混着思考与正文，分开记账。
+						sentC, sentT = nc, nt
 					}
 				default: // ThinkingReasoning
 					delta := map[string]any{}
@@ -693,7 +806,11 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 					}
 					if len(delta) > 0 {
 						s.writeChunk(delta, "")
+						sentC, sentT = nc, nt
 					}
+				}
+				if sentC > 0 || sentT > 0 {
+					s.tm.noteText(time.Now(), sentC, sentT)
 				}
 				s.mu.Unlock()
 				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {

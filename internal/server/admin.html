@@ -559,6 +559,8 @@ async function checkinAll(){
 
 /* ─── 用量统计 ─── */
 function pct(v){ return (v==null||v===0)?'-':Number(v).toFixed(1)+'%'; }
+function tps(v){ return (v==null||v===0)?'-':Number(v).toFixed(1); }
+function ms(v){ return (v==null||v===0)?'-':Math.round(v); }
 function cpm(v){ return (v==null||v===0)?'-':Number(v).toFixed(1); }
 const usageState = { page:1, pageSize:50, total:0, sort:'requests' };
 function gotoUsage(page, pageSize){
@@ -695,6 +697,7 @@ async function loadRequests(force){
       + ' · 换号 '+fmt(m.rotates)+' · 平均延迟 '+fmt(Math.round(m.avg_latency_ms||0))+'ms'
       + ' · 成功率 '+((m.success_rate||0)*100).toFixed(1)+'%'
       + ' · 在途 '+fmt(m.in_flight)
+      + (m.tps_samples? ' · 平均吞吐 '+tps(m.avg_tps)+' tok/s（'+fmt(m.tps_samples)+' 样本，平均生成 '+fmt(Math.round(m.avg_gen_ms||0))+'ms）':'')
       + (d.archive? ' · 归档 '+fmt(d.archive.files)+' 文件 / '+(d.archive.bytes/1048576).toFixed(1)+'MB':'');
     // total=-1 表示带过滤条件时不做全量扫描（总数未知），分页器退化为相对翻页。
     reqState.total = (d.total==null? -1 : d.total);
@@ -704,6 +707,10 @@ async function loadRequests(force){
     renderPager('pgReqs', reqState.page, reqState.pageSize, reqState.total, 'gotoReqs');
     if(!evs.length){ el.innerHTML='<div style="color:var(--dim);padding:14px">'+(reqState.page>1?'该页没有记录':'暂无记录')+'</div>'; return; }
     el.innerHTML = '<table class="accts"><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>结果</th>'
+      + '<th title="客户端看到第一个字的时刻（含选号/建连/上游排队/首包）">首字</th>'
+      + '<th title="上游开始吐第一帧的时刻，可与首字对比看本端处理开销">上游首帧</th>'
+      + '<th title="首帧→末帧的纯生成时长，TPS 的分母">生成</th>'
+      + '<th title="completion_tokens / 生成时长">吞吐</th>'
       + '<th>延迟</th><th>tokens</th><th>换号</th></tr></thead><tbody>'
       + evs.map(e=>{
           const ok = e.outcome==='success';
@@ -714,6 +721,12 @@ async function loadRequests(force){
             + '<td class="mono">'+esc((e.nickname?e.nickname+' / ':'')+(e.uid||'-'))+'</td>'
             + '<td class="mono">'+esc(e.status||'-')+'</td>'
             + '<td>'+badge(e.outcome||'-', cls)+(e.error?'<div class="mono" style="color:var(--dim);margin-top:4px">'+esc(String(e.error).slice(0,80))+'</div>':'')+'</td>'
+            + '<td class="mono" style="color:var(--dim)">'+ms(e.ttft_ms)+'ms</td>'
+            + '<td class="mono" style="color:var(--dim)">'+ms(e.upstream_ttf_ms)+'ms</td>'
+            + '<td class="mono" style="color:var(--dim)">'+ms(e.gen_ms)+'ms</td>'
+            + '<td class="mono">'+tps(e.tps)+' tok/s'
+              + (e.max_gap_ms? '<div style="font-size:10px;color:var(--dim)" title="相邻帧最大间隔，越大越卡">空档 '+ms(e.max_gap_ms)+'ms</div>':'')
+              + '</td>'
             + '<td class="mono">'+fmt(e.latency_ms)+'ms</td>'
             + '<td class="mono">'+fmt(e.total_tokens||0)+'</td>'
             + '<td class="mono">'+fmt(e.rotates||0)+'</td>'

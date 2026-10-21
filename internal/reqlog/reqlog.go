@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -72,9 +73,19 @@ type Event struct {
 	CacheReadTokens  int64     `json:"cache_read_tokens,omitempty"`
 	Rotates          int       `json:"rotates,omitempty"`
 	Stream           bool      `json:"stream,omitempty"`
-	Error            string    `json:"error,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	// 流式耗时拆解与吞吐。只对流式有意义；非流式为 0 且 omitempty 隐藏。
+	//
+	// GenMs 是「首帧→末帧」的纯生成时长，TPS 以它为分母。用总延迟当分母会把
+	// 上游排队/首包/思考前置算进去，系统性低估吞吐。
+	TTFTMs        int64   `json:"ttft_ms,omitempty"`         // 客户端看到第一个字
+	UpstreamTTFMs int64   `json:"upstream_ttf_ms,omitempty"` // 上游首帧
+	GenMs         int64   `json:"gen_ms,omitempty"`          // 首帧→末帧
+	MaxGapMs      int64   `json:"max_gap_ms,omitempty"`      // 最大帧间隔
+	TPS           float64 `json:"tps,omitempty"`             // completion_tokens / GenMs
+	CharPS        float64 `json:"char_ps,omitempty"`         // 下发字符 / GenMs
+	Error         string  `json:"error,omitempty"`
+	ClientIP      string  `json:"client_ip,omitempty"`
+	UserAgent     string  `json:"user_agent,omitempty"`
 }
 
 // Filter 归档查询条件；字符串字段为大小写不敏感的包含匹配，From/To 为闭区间。
@@ -90,21 +101,28 @@ type Filter struct {
 
 // Metrics 进程级累计指标。
 type Metrics struct {
-	StartedAt     time.Time `json:"started_at"`
-	Total         int64     `json:"total"`
-	InFlight      int64     `json:"in_flight"`
-	Succeeded     int64     `json:"succeeded"`
-	Failed        int64     `json:"failed"`
-	ClientErrors  int64     `json:"client_errors"`
-	Canceled      int64     `json:"canceled"`
-	Rotates       int64     `json:"rotates"`
-	PromptTokens  int64     `json:"prompt_tokens"`
-	ComplTokens   int64     `json:"completion_tokens"`
-	TotalTokens   int64     `json:"total_tokens"`
-	LatencySumMs  int64     `json:"latency_sum_ms"`
-	AvgLatencyMs  float64   `json:"avg_latency_ms"`
-	SuccessRate   float64   `json:"success_rate"`
-	DroppedWrites uint64    `json:"dropped_writes"`
+	StartedAt    time.Time `json:"started_at"`
+	Total        int64     `json:"total"`
+	InFlight     int64     `json:"in_flight"`
+	Succeeded    int64     `json:"succeeded"`
+	Failed       int64     `json:"failed"`
+	ClientErrors int64     `json:"client_errors"`
+	Canceled     int64     `json:"canceled"`
+	Rotates      int64     `json:"rotates"`
+	PromptTokens int64     `json:"prompt_tokens"`
+	ComplTokens  int64     `json:"completion_tokens"`
+	TotalTokens  int64     `json:"total_tokens"`
+	LatencySumMs int64     `json:"latency_sum_ms"`
+	AvgLatencyMs float64   `json:"avg_latency_ms"`
+	SuccessRate  float64   `json:"success_rate"`
+	// 流式吞吐聚合。只统计「有 TPS 样本」的请求，避免非流式把均值拉低。
+	TPSSamples    int64   `json:"tps_samples"`
+	TPSSum        float64 `json:"tps_sum"`
+	AvgTPS        float64 `json:"avg_tps"`
+	AvgTTFTMs     float64 `json:"avg_ttft_ms"`
+	AvgUpTTFMs    float64 `json:"avg_upstream_ttf_ms"`
+	AvgGenMs      float64 `json:"avg_gen_ms"`
+	DroppedWrites uint64  `json:"dropped_writes"`
 }
 
 // ArchiveStats 归档存储状态。
@@ -144,6 +162,13 @@ type Recorder struct {
 	totalTok   atomic.Int64
 	latencySum atomic.Int64
 	dropped    atomic.Uint64
+
+	// 流式吞吐聚合（只累加有 TPS 样本的请求）
+	tpsSamples atomic.Int64
+	tpsSumBits atomic.Uint64 // float64 bits
+	ttftSum    atomic.Int64
+	upTTFSum   atomic.Int64
+	genSum     atomic.Int64
 
 	arch *archive
 }
@@ -217,6 +242,19 @@ func (r *Recorder) Record(e Event) {
 	if e.Rotates > 0 {
 		r.rotates.Add(int64(e.Rotates))
 	}
+	// 只对「有生成时长 + 有 token 数」的流式请求采信 TPS 样本，
+	// 否则非流式（GenMs=0）会把均值稀释成无意义的低值。
+	if e.TPS > 0 && e.GenMs > 0 {
+		r.tpsSamples.Add(1)
+		addFloat(&r.tpsSumBits, e.TPS)
+		r.genSum.Add(e.GenMs)
+		if e.TTFTMs > 0 {
+			r.ttftSum.Add(e.TTFTMs)
+		}
+		if e.UpstreamTTFMs > 0 {
+			r.upTTFSum.Add(e.UpstreamTTFMs)
+		}
+	}
 
 	r.mu.Lock()
 	r.recent[r.head] = e
@@ -255,6 +293,14 @@ func (r *Recorder) Metrics() Metrics {
 	if total > 0 {
 		m.AvgLatencyMs = float64(m.LatencySumMs) / float64(total)
 		m.SuccessRate = float64(m.Succeeded) / float64(total)
+	}
+	if n := r.tpsSamples.Load(); n > 0 {
+		m.TPSSamples = n
+		m.TPSSum = loadFloat(&r.tpsSumBits)
+		m.AvgTPS = m.TPSSum / float64(n)
+		m.AvgTTFTMs = float64(r.ttftSum.Load()) / float64(n)
+		m.AvgUpTTFMs = float64(r.upTTFSum.Load()) / float64(n)
+		m.AvgGenMs = float64(r.genSum.Load()) / float64(n)
 	}
 	return m
 }
@@ -521,6 +567,23 @@ func (f Filter) match(e Event) bool {
 
 func containsFold(s, sub string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
+}
+
+// addFloat 用 atomic.Uint64 存 float64 位模式做无锁累加（CAS 循环）。
+// 吞吐聚合是低频写（每请求一次）高频读（面板轮询），额外几次 CAS 无所谓。
+func addFloat(bits *atomic.Uint64, delta float64) {
+	for {
+		old := bits.Load()
+		next := math.Float64bits(math.Float64frombits(old) + delta)
+		if bits.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// loadFloat 读回 addFloat 累加的值。
+func loadFloat(bits *atomic.Uint64) float64 {
+	return math.Float64frombits(bits.Load())
 }
 
 type archiveFile struct {
