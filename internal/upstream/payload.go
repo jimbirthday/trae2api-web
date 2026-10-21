@@ -28,6 +28,11 @@ func PrepareBody(src []byte) []byte {
 	}
 	obj["stream"] = true
 	obj["function"] = Function
+	// stream_options 是 OpenAI 的下游语义（是否回传 usage），由本服务处理；
+	// 上游 SOLO 不认这个字段，转发过去可能被判非法参数，必须剥掉。
+	delete(obj, "stream_options")
+	// 同理：这些是 OpenAI 侧的参数，上游 llm_utils_chat 不接受。
+	delete(obj, "stream_options_include_usage")
 
 	if msgs, ok := obj["messages"].([]any); ok {
 		for _, mi := range msgs {

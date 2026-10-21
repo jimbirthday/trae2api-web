@@ -33,7 +33,7 @@
 - **多账号智能调度池**：加权选号（余额 × 闲置补偿 × 手动权重 × 连败降权）、Top5 加权随机打散、单账号在途租约限流、账号级 + 模型级两级冷却、软限流指数退避、熔断与连败降权、会话粘性、超时/断连不误罚号。
 - **自动化运维与保活**：每日定时自动签到，并在 Token 过期前 24 小时自动预刷新与原子落盘，保障长周期稳定可用。
 - **新模型支持**：同步支持 glm-5.3、glm-5.2 等新版模型调度，适配最新协议版本。
-- **丝滑的流式输出**：响应头 + `role` 帧在**毫秒级**下发（不等上游握手），段内逐帧 flush，跨 chunk 恒定 `id`/`created`/`model`；上游思考期由心跳 SSE 注释保活，思考内容可按 `stream.thinking` 选择走 `reasoning_content` 或包 `think` 标签当正文输出。
+- **丝滑的流式输出**：响应头 + `role` 帧在**毫秒级**下发（不等上游握手），段内逐帧 flush，跨 chunk 恒定 `id`/`created`/`model`；上游思考期由心跳 SSE 注释保活，思考内容可按 `stream.thinking` 选择走 `reasoning_content` 或包 `<think>` 标签当正文输出。
 - **纯净轻量**：纯 Go 标准库开发，零第三方运行时依赖，静态编译产物小巧，内存占用极低。
 
 ## 快速开始
@@ -250,6 +250,38 @@ N 个账号就是 2N 次上游调用。改前「切 tab 就全量重查」，5 �
   供备份/迁移，返回格式与本仓库 `auths/trae-*.json` 同构（可直接重新导入）。
   该接口强制要求 Bearer，响应带 `Cache-Control: no-store`；输出请勿外传。
 
+## OpenAI 兼容性
+
+对外接口严格遵循 OpenAI Chat Completions 规范，三个容易被忽略的点：
+
+**思考内容不进 `content`。** 默认 `stream.thinking=reasoning`：`content` 只有正文，
+思考链走 `message.reasoning_content` / `delta.reasoning_content`（DeepSeek 引入的扩展字段，
+Cherry Studio / OpenWebUI / Chatbox 等会渲染成可折叠的思考过程；不认识该字段的客户端直接忽略，
+不影响正文）。这与非流式输出完全一致——流式和非流式必须对同一请求给出同构结果。
+
+若客户端只渲染 `content`、需要「启动即出字」，可设 `stream.thinking=content`，
+此时思考会包进 `<think>…</think>`（社区事实标准，主流前端能折叠）。**不要**把这理解成
+OpenAI 原生行为，它只是为了照顾不识别 `reasoning_content` 的客户端。
+
+**`usage` 只有标准字段。** 上游给的是 Anthropic 风格且夹带大量内部计数器
+（`cache_read_input_tokens`、`reasoning_tokens`、`*_total`、`cluster`…），
+对外统一转成：
+
+```json
+{"prompt_tokens":20,"completion_tokens":153,"total_tokens":173,
+ "prompt_tokens_details":{"cached_tokens":0},
+ "completion_tokens_details":{"reasoning_tokens":151}}
+```
+
+`cached_tokens` 是 `prompt_tokens` 的子集，不重复计入 `total_tokens`。
+
+**usage chunk 按需下发。** 遵循 `stream_options.include_usage`：只有客户端显式要，
+才在 `[DONE]` 之前追加一个 `choices: []` 的纯 usage chunk。默认不发——多发的 usage chunk
+会让「最后一条 chunk 必须有 choice」的客户端报错。服务端自身的用量记账不受此影响。
+
+流内错误同样用标准格式：`data: {"error":{"message":…,"type":…,"code":…}}` + `data: [DONE]`，
+不使用非标准的 `event: error`（客户端不会把它当错误处理，流会无声断掉）。
+
 ## 配置项参考
 
 所有配置项均可通过环境变量或 `config.json` 进行调整：
@@ -276,7 +308,7 @@ N 个账号就是 2N 次上游调用。改前「切 tab 就全量重查」，5 �
 | `TW2A_REQLOG_ENABLED` | `true` | 是否记录请求流水 |
 | `TW2A_REQLOG_DIR` | `./data/logs` | 请求流水归档目录 |
 | `TW2A_REQLOG_RETAIN_DAYS` | `3` | 归档保留天数（含当天，小时级自动清理） |
-| `TW2A_STREAM_THINKING` | `content` | 思考内容呈现：`reasoning`（走 `reasoning_content`）/ `content`（包 `think` 标签当正文，空档期立刻有字）/ `none`（丢弃） |
+| `TW2A_STREAM_THINKING` | `reasoning` | 思考内容呈现：`reasoning`（走 `reasoning_content`，正文干净，推荐）/ `content`（包 `<think>` 标签当正文，空档期立刻有字）/ `none`（丢弃） |
 | `TW2A_STREAM_HEARTBEAT` | `1s` | 空闲保活间隔（上游静默时写 SSE 注释，防代理掐断）；`0`/`off` 关闭 |
 | `TW2A_USAGE_ENABLED` | `true` | 是否统计按模型用量（token/缓存/积分采样） |
 | `TW2A_USAGE_FILE` | `./data/usage.json` | 用量统计持久化文件 |

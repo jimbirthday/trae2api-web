@@ -106,8 +106,46 @@ func TestAggregateSOLO(t *testing.T) {
 		t.Errorf("finish_reason=%v", choices[0].(map[string]any)["finish_reason"])
 	}
 	usage := resp["usage"].(map[string]any)
-	if usage["total_tokens"].(float64) != 163 {
-		t.Errorf("usage=%v", usage)
+	if n, ok := usage["total_tokens"].(int64); !ok || n != 163 {
+		t.Errorf("total_tokens=%v (%T)", usage["total_tokens"], usage["total_tokens"])
+	}
+	if n, ok := usage["prompt_tokens"].(int64); !ok || n != 21 {
+		t.Errorf("prompt_tokens=%v", usage["prompt_tokens"])
+	}
+	if n, ok := usage["completion_tokens"].(int64); !ok || n != 142 {
+		t.Errorf("completion_tokens=%v", usage["completion_tokens"])
+	}
+	// OpenAI 标准：思考 token 走 completion_tokens_details.reasoning_tokens
+	details, ok := usage["completion_tokens_details"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing completion_tokens_details: %v", usage)
+	}
+	if n, ok := details["reasoning_tokens"].(int64); !ok || n != 135 {
+		t.Errorf("reasoning_tokens=%v", details["reasoning_tokens"])
+	}
+	// 上游的内部计数器绝不能透给客户端
+	for _, leaked := range []string{"reasoning_tokens_total", "prompt_tokens_total", "cluster", "name"} {
+		if _, bad := usage[leaked]; bad {
+			t.Errorf("leaked upstream field %q into usage: %v", leaked, usage)
+		}
+	}
+}
+
+// usage 必须严格只有 OpenAI 定义的键，多一个字段严格 SDK 就会报错。
+func TestAggregateUsageKeysAreOpenAIStandard(t *testing.T) {
+	resp, err := Aggregate(strings.NewReader(soloSSEFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := resp["usage"].(map[string]any)
+	allowed := map[string]bool{
+		"prompt_tokens": true, "completion_tokens": true, "total_tokens": true,
+		"prompt_tokens_details": true, "completion_tokens_details": true,
+	}
+	for k := range usage {
+		if !allowed[k] {
+			t.Errorf("unexpected usage key %q", k)
+		}
 	}
 }
 
@@ -500,17 +538,53 @@ func TestStreamThinkingInContent(t *testing.T) {
 		}
 	}
 	out := got.String()
-	if !strings.HasPrefix(out, " thinking") {
-		t.Errorf("thinking should be wrapped in think tag: %q", out)
+	// 必须是完整的 <think>…</think>：缺了尖括号客户端不会折叠，思考会当正文显示。
+	if !strings.HasPrefix(out, "<think>") {
+		t.Errorf("thinking must open with <think>: %q", out)
+	}
+	if !strings.Contains(out, "</think>") {
+		t.Errorf("thinking must be closed with </think>: %q", out)
+	}
+	if strings.Count(out, "<think>") != 1 || strings.Count(out, "</think>") != 1 {
+		t.Errorf("think tag must appear exactly once: %q", out)
+	}
+	// 正文必须在 think 块之外
+	if i, j := strings.Index(out, "</think>"), strings.Index(out, "答案"); i < 0 || j < i {
+		t.Errorf("answer should come after </think>: %q", out)
 	}
 	if !strings.Contains(out, "想一想") {
 		t.Errorf("thinking text lost: %q", out)
 	}
-	if !strings.Contains(out, "答案") {
-		t.Errorf("answer missing: %q", out)
+}
+
+// ThinkingContent 模式下若上游先给正文、后补思考，思考不能直接混进正文。
+func TestStreamThinkingContentLateReasoning(t *testing.T) {
+	sse := "event:output\ndata:{\"response\":\"答案\",\"reasoning_content\":\"\"}\n\n" +
+		"event:output\ndata:{\"response\":\"\",\"reasoning_content\":\"迟到的思考\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
+	rec := httptest.NewRecorder()
+	if err := StreamWithOptions(rec, strings.NewReader(sse), StreamOptions{Thinking: ThinkingContent}); err != nil {
+		t.Fatal(err)
 	}
-	if strings.Count(out, " thinking") != 1 {
-		t.Errorf("think tag opened more than once: %q", out)
+	var got strings.Builder
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+			continue
+		}
+		ch := m["choices"].([]any)[0].(map[string]any)
+		if c, ok := ch["delta"].(map[string]any)["content"].(string); ok {
+			got.WriteString(c)
+		}
+	}
+	out := got.String()
+	// 迟到的思考要么被丢弃、要么合法地包进新的 think 块；绝不允裸文本混入正文。
+	if strings.Contains(out, "迟到的思考") && !strings.Contains(out, "<think>\n\n迟到的思考") {
+		t.Errorf("late reasoning leaked as raw text: %q", out)
 	}
 }
 

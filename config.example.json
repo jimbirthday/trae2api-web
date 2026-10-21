@@ -21,7 +21,7 @@
     "credit_floor": 0
   },
   "stream": {
-    "thinking": "content",
+    "thinking": "reasoning",
     "heartbeat": "1s"
   },
   "usage": {

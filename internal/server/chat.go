@@ -63,6 +63,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	var peek struct {
 		Stream bool   `json:"stream"`
 		Model  string `json:"model"`
+		// StreamOptions 只需读 include_usage：OpenAI 规定该标志为 true 时，
+		// 才在 [DONE] 前追加一个只带 usage 的 chunk。
+		StreamOptions struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
 	}
 	_ = json.Unmarshal(body, &peek)
 	rec.Stream = peek.Stream
@@ -264,6 +269,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				Model: sseModel,
 				// 思考期给客户端看什么（上游思考可达数千字/数十秒）。
 				Thinking: h.cfg.StreamThinking,
+				// usage chunk 只在客户端显式要求时下发（OpenAI stream_options 语义）。
+				IncludeUsage: peek.StreamOptions.IncludeUsage,
 				OnError: func(se *upstream.SOLOStreamError) {
 					h.handleStreamError(acct.UID, configName, se)
 				},

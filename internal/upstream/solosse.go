@@ -252,8 +252,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			},
 		},
 	}
-	if usage != nil {
-		resp["usage"] = usage
+	// 非流式也必须用同一套 OpenAI 结构：流式/非流式 usage 字段不一致，
+	// 会让客户端按会话聚合时把两者当成不同来源。
+	if u := normalizeUsage(usage); u != nil {
+		resp["usage"] = u
 	}
 	return resp, nil
 }
@@ -355,6 +357,13 @@ type StreamOptions struct {
 	//   ThinkingContent         → 包进 think 标签作为 delta.content
 	//   ThinkingNone            → 丢弃
 	Thinking ThinkingMode
+	// IncludeUsage 对应 OpenAI 的 stream_options.include_usage。
+	//
+	// OpenAI 规范：只有客户端显式要求时，才在 [DONE] 之前追加一个
+	// choices 为空数组、只带 usage 的 chunk。默认不下发——多发的 usage chunk
+	// 会让按「最后一条 chunk 必须有 choice」实现的客户端报错。
+	// 注意这只影响「是否下发」，服务端自身的用量记账始终进行。
+	IncludeUsage bool
 }
 
 // ThinkingMode 思考内容的呈现方式。
@@ -375,10 +384,16 @@ const (
 	ThinkingNone
 )
 
-// 思考块标记（与主流前端约定一致，Cherry Studio / OpenWebUI 等会折叠显示）。
+// 思考块标记。
+//
+// 用 <think>…</think>：这是社区事实标准，Cherry Studio / OpenWebUI / Chatbox /
+// LobeChat 等前端都识别并折叠显示；不识别的前端也只会看到一对无害的标签。
+//
+// 注意不能省略尖括号：早先这里写成 " thinking\n\n"（丢了 '<>'），客户端拿到的是
+// 一段裸文本 " thinking"，既不折叠也不隐藏，思考内容就直接当正文糊在脸上。
 const (
-	thinkOpenTag  = " thinking\n\n"
-	thinkCloseTag = "\n\n<｜end▁of▁thinking｜>\n\n"
+	thinkOpenTag  = "<think>\n\n"
+	thinkCloseTag = "\n\n</think>\n\n"
 )
 
 // DefaultHeartbeat 默认空闲保活间隔。
@@ -412,10 +427,9 @@ type SSEWriter struct {
 	contentSeen   textAcc
 	reasoningSeen textAcc
 
-	// thinking 模式与「思考块是否已开」状态（ThinkingContent 模式下维护）。
-	thinking    ThinkingMode
-	thinkOpened bool
-	thinkClosed bool
+	// thinking 模式与「当前是否处于思考块内」（ThinkingContent 模式下维护）。
+	thinking  ThinkingMode
+	thinkOpen bool
 
 	hbDone chan struct{}
 	hbWG   sync.WaitGroup
@@ -514,13 +528,30 @@ func (s *SSEWriter) Close() {
 
 // WriteError 在已开的流内报错（响应头已发 200，无法再改状态码）。
 // 同时发一条 OpenAI 风格的 error 事件与 [DONE]，客户端不会一直挂着。
+// WriteError 在流已开始后报告错误。
+//
+// OpenAI 把流内错误放在普通 data 帧里、用顶层 error 对象承载：
+//
+//	data: {"error":{"message":"...","type":"api_error","code":"stream_error"}}
+//	data: [DONE]
+//
+// 早先这里发的是 `event: error` + 一段 JSON 字符串。事件名不是 OpenAI 的约定，
+// 客户端不会按错误处理，通常直接丢弃 → 用户看到流无声无息地断掉。
 func (s *SSEWriter) WriteError(msg string) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.writeRawLocked("event: error\ndata: " + jsonEscape(msg) + "\n\n")
+	errChunk := map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    "api_error",
+			"code":    "stream_error",
+		},
+	}
+	raw, _ := json.Marshal(errChunk)
+	s.writeRawLocked("data: " + string(raw) + "\n\n")
 	s.writeRawLocked("data: [DONE]\n\n")
 }
 
@@ -629,19 +660,23 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 					}
 				case ThinkingContent:
 					// 思考当正文发：空档期立刻有字在动，观感就是「边想边说」。
-					// 用 think 标签包起来，支持折叠的客户端仍会收成「思考过程」。
+					// 用 <think> 包起来，支持折叠的客户端仍会收成「思考过程」。
+					//
+					// thinkOpen 表示「当前处于思考块内」。上正文时关块，之后再收到
+					// 思考（上游分多段下发、或正文先到思考后补）就重新开一个新块——
+					// 否则那段思考会以裸文本插进正文中间，客户端既不折叠也不隐藏。
 					var buf strings.Builder
 					if think != "" {
-						if !s.thinkOpened {
+						if !s.thinkOpen {
 							buf.WriteString(thinkOpenTag)
-							s.thinkOpened = true
+							s.thinkOpen = true
 						}
 						buf.WriteString(think)
 					}
 					if out != "" {
-						if s.thinkOpened && !s.thinkClosed {
+						if s.thinkOpen {
 							buf.WriteString(thinkCloseTag)
-							s.thinkClosed = true
+							s.thinkOpen = false
 						}
 						buf.WriteString(out)
 					}
@@ -679,28 +714,35 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 				s.writeRawLocked(": keepalive\n\n")
 				s.mu.Unlock()
 			case "done":
+				finish := ev.FinishReason
+				if finish == "" {
+					finish = "stop"
+				}
 				s.mu.Lock()
-				if s.thinking == ThinkingContent && s.thinkOpened && !s.thinkClosed {
+				if s.thinking == ThinkingContent && s.thinkOpen {
 					s.writeChunk(map[string]any{"content": thinkCloseTag}, "")
-					s.thinkClosed = true
+					s.thinkOpen = false
 				}
-				if pendingUsage != nil {
-					usageChunk := map[string]any{
-						"id":      s.id,
-						"object":  "chat.completion.chunk",
-						"created": s.created,
-						"model":   s.model,
-						"choices": []any{map[string]any{
-							"index": 0, "delta": map[string]any{}, "finish_reason": ev.FinishReason,
-						}},
-						"usage": pendingUsage,
+				// 带 finish_reason 的收尾 chunk 永远要发（OpenAI 客户端靠它结束）。
+				s.writeChunk(map[string]any{}, finish)
+				// usage chunk 只在客户端要了的时候才发，且 choices 必须是空数组：
+				// 若复用上面的 choice 结构，就会出现「第二条 finish_reason」，
+				// 严格实现会把它当成重复终止信号。
+				if opts.IncludeUsage && pendingUsage != nil {
+					if u := normalizeUsage(pendingUsage); u != nil {
+						usageChunk := map[string]any{
+							"id":      s.id,
+							"object":  "chat.completion.chunk",
+							"created": s.created,
+							"model":   s.model,
+							"choices": []any{},
+							"usage":   u,
+						}
+						raw, _ := json.Marshal(usageChunk)
+						s.writeRawLocked("data: " + string(raw) + "\n\n")
 					}
-					raw, _ := json.Marshal(usageChunk)
-					s.writeRawLocked("data: " + string(raw) + "\n\n")
-					pendingUsage = nil
-				} else {
-					s.writeChunk(map[string]any{}, ev.FinishReason)
 				}
+				pendingUsage = nil
 				s.writeRawLocked("data: [DONE]\n\n")
 				s.mu.Unlock()
 				sawDone = true
