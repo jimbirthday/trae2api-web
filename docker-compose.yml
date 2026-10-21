@@ -6,7 +6,8 @@ services:
       context: .
       dockerfile: Dockerfile
     image: trae2api-web:local
-    container_name: trae2api-web
+    # 容器名可用 TW2A_CONTAINER_NAME 覆盖（同机跑多个实例时不冲突）
+    container_name: ${TW2A_CONTAINER_NAME:-trae2api-web}
     restart: unless-stopped
     environment:
       - TZ=${TZ:-Asia/Shanghai}
