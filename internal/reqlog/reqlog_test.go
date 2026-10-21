@@ -2,6 +2,7 @@ package reqlog
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -258,5 +259,100 @@ func TestCloseIsIdempotentAndFlushes(t *testing.T) {
 	got, err := r.ReadArchive(0, Filter{})
 	if err != nil || len(got) != 1 {
 		t.Fatalf("after close=%v,%v", got, err)
+	}
+}
+
+// 倒读实现必须与正序扫描结果一致：多分页、多文件、跨块边界都不能错。
+func TestReadArchivePageAcrossChunks(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Dir: dir, Enabled: true, FileMaxBytes: 2 << 10}) // 小文件强制多文件
+	now := time.Now()
+	const n = 300
+	for i := 0; i < n; i++ {
+		r.Record(Event{
+			RequestID: fmt.Sprintf("r%03d", i),
+			Time:      now.Add(time.Duration(i) * time.Second),
+			UID:       "u1",
+			Model:     "m1",
+			Outcome:   "success",
+			Status:    200,
+			Path:      "/v1/chat/completions",
+		})
+	}
+	r.Close() // flush
+
+	// 全量：最新在前
+	all, err := r.ReadArchivePage(0, 1000, Filter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != n {
+		t.Fatalf("all=%d want %d", len(all), n)
+	}
+	for i := 0; i < n; i++ {
+		want := fmt.Sprintf("r%03d", n-1-i)
+		if all[i].RequestID != want {
+			t.Fatalf("index %d = %s want %s", i, all[i].RequestID, want)
+		}
+	}
+
+	// 分页拼起来必须等于全量
+	var glued []string
+	for off := 0; off < n; off += 37 {
+		pg, err := r.ReadArchivePage(off, 37, Filter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range pg {
+			glued = append(glued, e.RequestID)
+		}
+	}
+	if len(glued) != n {
+		t.Fatalf("glued=%d want %d", len(glued), n)
+	}
+	for i := 0; i < n; i++ {
+		if glued[i] != all[i].RequestID {
+			t.Fatalf("page glue mismatch at %d: %s vs %s", i, glued[i], all[i].RequestID)
+		}
+	}
+
+	// 越界 offset 返回空切片（不是 nil，前端据此判断「该页无记录」）
+	if got, _ := r.ReadArchivePage(10*n, 10, Filter{}); len(got) != 0 {
+		t.Fatalf("out of range=%d want 0", len(got))
+	}
+
+	// 过滤 + 分页
+	f := Filter{UID: "u1"}
+	if got, _ := r.ReadArchivePage(0, 5, f); len(got) != 5 {
+		t.Fatalf("filtered page=%d", len(got))
+	}
+	if got, _ := r.ReadArchivePage(0, 5, Filter{UID: "nope"}); len(got) != 0 {
+		t.Fatalf("no match=%d", len(got))
+	}
+}
+
+// 精确总数只对「无过滤条件」生效，且与真实行数一致。
+func TestArchiveTotal(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Dir: dir, Enabled: true, FileMaxBytes: 2 << 10})
+	defer r.Close()
+	if n, ok := r.ArchiveTotal(Filter{}); n != 0 || !ok {
+		t.Fatalf("empty total=%d,%v", n, ok)
+	}
+	for i := 0; i < 120; i++ {
+		r.Record(Event{RequestID: fmt.Sprintf("x%03d", i), Path: "/v1/chat/completions", Outcome: "success"})
+	}
+	r.Close()
+
+	if n, ok := r.ArchiveTotal(Filter{}); !ok || n != 120 {
+		t.Fatalf("total=%d ok=%v want 120,true", n, ok)
+	}
+	// 带过滤：不做全量扫描，报告未知
+	if n, ok := r.ArchiveTotal(Filter{UID: "u1"}); ok || n != 0 {
+		t.Fatalf("filtered total should be unknown, got %d,%v", n, ok)
+	}
+	// 缓存生效后再调一次仍正确
+	if n, ok := r.ArchiveTotal(Filter{}); !ok || n != 120 {
+		t.Fatalf("cached total=%d ok=%v", n, ok)
 	}
 }

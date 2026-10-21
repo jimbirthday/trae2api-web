@@ -215,8 +215,27 @@ TRAE 是无状态全量上下文，粘性不解决上下文拼接，但能避免
 ### 请求流水
 
 `reqlog` 记录每请求的 uid / 模型 / 状态 / 结果 / 延迟 / tokens / 换号次数，
-内存保留最近 100 条，可选按天归档到 `data/logs/requests-YYYYMMDD-N.jsonl`（默认 16MiB/文件、保留 7 天）。
-面板「请求流水」页可按 uid / 模型 / 结果过滤。**不记录提示词、响应正文与凭证。**
+内存保留最近 512 条，可选按天归档到 `data/logs/requests-YYYYMMDD-N.jsonl`（默认 16MiB/文件、保留 7 天）。
+面板「请求流水」页可按 uid / 模型 / 结果过滤并分页。**不记录提示词、响应正文与凭证。**
+
+归档读取走**文件尾部倒读**（按 64KiB 块从末尾往前扫，凑够一页就停），不再整文件解析；
+无过滤条件时的总数用「按 (文件, 大小) 缓存的行数」直接给出，带过滤条件时不做全量扫描、总数显示为未知。
+20 万行（约 60MiB）归档下取一页 50 条的实测：**386ms → 0.10ms**（`go test -bench BenchmarkTailVsFullScan`）。
+
+### 面板分页与性能
+
+四个页面都是服务端分页，前端只渲染当前页：
+
+| 页面 | 接口 | 默认每页 | 说明 |
+|---|---|---|---|
+| 账号管理 | `GET /admin/api/accounts?page=&page_size=&q=&status=` | 20 | `q` 搜 uid/昵称/备注，`status`=ok/cooling/paused/off/disabled |
+| 额度监控 | `GET /admin/api/credits?page=&page_size=&refresh=1` | 30 | **服务端缓存 60s**；`refresh=1` 强制穿透；上游并发上限 6 |
+| 请求流水 | `GET /admin/api/requests?offset=&limit=&uid=&model=&outcome=` | 50 | `offset`=跳过最新 N 条；返回 `total` 与 `total_exact` |
+| 用量统计 | `GET /admin/api/usage?page=&page_size=&sort=&q=` | 50 | `sort`=requests/model/tokens/cache/credits；合计行恒为全量口径 |
+
+额度页为什么必须缓存：每个账号一次刷新要打上游两次（`EntUsage` + `CheckinStatus`），
+N 个账号就是 2N 次上游调用。改前「切 tab 就全量重查」，5 个号切一次要 ~3s；
+现在切 tab / 翻页走缓存（毫秒级），只有点「实时查询上游」才穿透，且同一时刻只允许一份刷新在跑。
 
 ### 面板运维动作
 

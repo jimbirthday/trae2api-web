@@ -9,10 +9,12 @@ package reqlog
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,8 +25,9 @@ import (
 )
 
 const (
-	// recentCap 内存最近事件条数。
-	recentCap = 100
+	// recentCap 内存最近事件条数。面板「请求流水」翻页时内存侧要够用，
+	// 否则每翻一页都得回落到扫归档文件。512 条 Event 约几百 KB，可忽略。
+	recentCap = 512
 	// defaultFileMax 单归档文件默认上限 16MiB。
 	defaultFileMax int64 = 16 << 20
 	// defaultQueue 归档写队列默认深度。
@@ -296,62 +299,196 @@ func (r *Recorder) Close() {
 
 // ReadArchive 读取归档事件（最新在前），支持时间范围/uid/model/outcome 过滤。
 func (r *Recorder) ReadArchive(limit int, f Filter) ([]Event, error) {
+	return r.ReadArchivePage(0, limit, f)
+}
+
+// ReadArchivePage 从归档读取一页（最新在前）：跳过最新 offset 条匹配，取 limit 条。
+//
+// 实现要点（上一版每次查询都正序扫完整个文件并逐行 Unmarshal，翻页/深 offset
+// 时代价随文件大小线性增长）：
+//   - 从文件尾部按块倒读，凑够 need 条匹配就停 —— 只解析真正要用的行；
+//   - 多文件之间按文件名（日期+序号）从新到旧依次倒读。
+func (r *Recorder) ReadArchivePage(offset, limit int, f Filter) ([]Event, error) {
 	if r.arch == nil {
 		return nil, nil
-	}
-	files, err := r.arch.listFiles()
-	if err != nil {
-		return nil, err
 	}
 	if limit <= 0 {
 		limit = recentCap
 	}
+	if offset < 0 {
+		offset = 0
+	}
+	need := offset + limit
+	files, err := r.arch.listFiles()
+	if err != nil {
+		return nil, err
+	}
 	var out []Event
-	// 文件名含日期与序号，字典序即写入序；从新到旧扫描，够 limit 即停。
-	for i := len(files) - 1; i >= 0 && len(out) < limit; i-- {
-		events, err := readFile(files[i].path, f, limit-len(out))
+	for i := len(files) - 1; i >= 0 && len(out) < need; i-- {
+		events, err := readTailMatches(files[i].path, f, need-len(out))
 		if err != nil {
-			return out, err
+			return trimPage(out, offset, limit), err
 		}
 		out = append(out, events...)
 	}
-	return out, nil
+	return trimPage(out, offset, limit), nil
 }
 
-// readFile 读取单个 JSONL 文件并倒序返回匹配事件（最多 need 条）。
-func readFile(path string, f Filter, need int) ([]Event, error) {
+// trimPage 从「最新在前的全量匹配」里切出一页。
+func trimPage(all []Event, offset, limit int) []Event {
+	if offset >= len(all) {
+		return []Event{}
+	}
+	all = all[offset:]
+	if limit > 0 && len(all) > limit {
+		all = all[:limit]
+	}
+	return all
+}
+
+// ArchiveTotal 返回归档中的事件总数及是否精确。
+//
+// 精确分支（无过滤条件）：只做换行符计数，且按 (path,size) 缓存，
+// 除首次之外都是 O(文件数) 的 map 查表。
+// 近似分支（带过滤条件）：不要为了一次翻页把七天日志全解析一遍，
+// 直接返回 0/false，前端退化为「上一页/下一页」翻页。
+func (r *Recorder) ArchiveTotal(f Filter) (int64, bool) {
+	if r.arch == nil {
+		return 0, false
+	}
+	if f != (Filter{}) {
+		return 0, false
+	}
+	total, err := r.arch.totalLines()
+	if err != nil {
+		return 0, false
+	}
+	return total, true
+}
+
+// totalLines 汇总所有归档文件的行数（带缓存）。
+func (a *archive) totalLines() (int64, error) {
+	files, err := a.listFiles()
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, f := range files {
+		n, err := a.linesOf(f)
+		if err != nil {
+			continue // 单个文件读失败不应让整页报错
+		}
+		total += n
+	}
+	return total, nil
+}
+
+// linesOf 返回单个文件的行数（按 size 缓存）。
+func (a *archive) linesOf(f archiveFile) (int64, error) {
+	a.cntMu.Lock()
+	if c, ok := a.counts[f.path]; ok && c.size == f.size {
+		a.cntMu.Unlock()
+		return c.lines, nil
+	}
+	a.cntMu.Unlock()
+
+	fh, err := os.Open(f.path)
+	if err != nil {
+		return 0, err
+	}
+	defer fh.Close()
+	buf := make([]byte, 256<<10)
+	var lines, n int64
+	var last byte
+	for {
+		k, err := fh.Read(buf)
+		if k > 0 {
+			n += int64(k)
+			lines += int64(bytes.Count(buf[:k], []byte{'\n'}))
+			last = buf[k-1]
+		}
+		if err != nil {
+			break
+		}
+	}
+	if n > 0 && last != '\n' {
+		lines++ // 最后一行没有换行符结尾（正在写入）
+	}
+	a.cntMu.Lock()
+	a.counts[f.path] = fileLines{size: f.size, lines: lines}
+	a.cntMu.Unlock()
+	return lines, nil
+}
+
+// readTailMatches 从文件尾部倒读，返回最多 need 条匹配事件（最新在前）。
+// 只解析凑够 need 条所需的行，不再无条件正序扫全文件。
+func readTailMatches(path string, f Filter, need int) ([]Event, error) {
+	if need <= 0 {
+		return nil, nil
+	}
 	fh, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer fh.Close()
-	var all []Event
-	sc := bufio.NewScanner(fh)
-	sc.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	for sc.Scan() {
-		line := sc.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-		var e Event
-		if err := json.Unmarshal(line, &e); err != nil {
-			continue // 半行（进程被杀）等损坏行跳过
-		}
-		if f.match(e) {
-			all = append(all, e)
-		}
-	}
-	if err := sc.Err(); err != nil {
+	st, err := fh.Stat()
+	if err != nil {
 		return nil, err
 	}
-	// 文件内时间递增，倒序取尾部 need 条。
-	if len(all) > need {
-		all = all[len(all)-need:]
+	size := st.Size()
+	if size == 0 {
+		return nil, nil
 	}
-	for i, j := 0, len(all)-1; i < j; i, j = i+1, j-1 {
-		all[i], all[j] = all[j], all[i]
+	const chunk = 64 << 10
+	const maxLine = 4 << 20
+	out := make([]Event, 0, need)
+	var pending []byte // 行尾片段（属于更新一侧），等更早的数据拼齐
+	pos := size
+	for pos > 0 && len(out) < need {
+		n := int64(chunk)
+		if pos < n {
+			n = pos
+		}
+		pos -= n
+		buf := make([]byte, n)
+		if _, rerr := fh.ReadAt(buf, pos); rerr != nil && rerr != io.EOF {
+			return out, rerr
+		}
+		data := append(buf, pending...)
+		start := 0
+		if pos > 0 {
+			i := bytes.IndexByte(data, '\n')
+			if i < 0 {
+				// 整块都是半行（超长行）：继续往前读，但要防内存失控。
+				if len(data) <= maxLine {
+					pending = data
+				} else {
+					pending = nil
+				}
+				continue
+			}
+			start = i + 1
+			pending = append([]byte(nil), data[:start]...) // 半行留给更早的块拼齐
+		} else {
+			pending = nil
+		}
+		lines := bytes.Split(data[start:], []byte{'\n'})
+		for i := len(lines) - 1; i >= 0 && len(out) < need; i-- {
+			line := bytes.TrimSpace(lines[i])
+			if len(line) == 0 {
+				continue
+			}
+			var e Event
+			if json.Unmarshal(line, &e) != nil {
+				continue // 半行（进程被杀）等损坏行跳过
+			}
+			if !f.match(e) {
+				continue
+			}
+			out = append(out, e)
+		}
 	}
-	return all, nil
+	return out, nil
 }
 
 // match 判定事件是否满足过滤条件。
@@ -408,10 +545,23 @@ type archive struct {
 	dropCount atomic.Uint64
 	lastErr   atomic.Value // string
 	files     []archiveFile
+
+	// cntMu/counts 是「每个归档文件的行数」缓存，只按 (path,size) 失效。
+	// 面板分页要显示总数，逐次全量扫文件代价太高；文件只追加不修改，
+	// size 不变即行数不变，因此这个缓存几乎不需要失效。
+	cntMu  sync.Mutex
+	counts map[string]fileLines
+}
+
+// fileLines 某归档文件的行数缓存（size 变化则重算）。
+type fileLines struct {
+	size  int64
+	lines int64
 }
 
 func newArchive(cfg Config) *archive {
-	a := &archive{cfg: cfg, queue: make(chan Event, cfg.QueueSize), done: make(chan struct{})}
+	a := &archive{cfg: cfg, queue: make(chan Event, cfg.QueueSize), done: make(chan struct{}),
+		counts: make(map[string]fileLines)}
 	_ = os.MkdirAll(cfg.Dir, 0o755)
 	a.cleanup()
 	a.wg.Add(1)

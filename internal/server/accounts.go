@@ -52,8 +52,18 @@ type accountSummary struct {
 	HasAuth     bool   `json:"has_auth"`
 }
 
-// adminAccounts GET /admin/api/accounts：列表（无鉴权，只读）。
+// adminAccounts GET /admin/api/accounts?page=&page_size=&q=&status=
+//
+// 分页在服务端做：账号多时前端一次性渲染上千行、每行 8 个按钮，DOM 与
+// 事件字符串拼接会明显卡顿；这里只返回一页，并给出 total 供翻页。
+// page 从 1 开始；page_size 默认 20，上限 200。
 func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	pageSize := clampInt(q.Get("page_size"), 20, 1, 200)
+	page := clampInt(q.Get("page"), 1, 1, 1<<20)
+	keyword := strings.ToLower(strings.TrimSpace(q.Get("q")))
+	wantStatus := strings.ToLower(strings.TrimSpace(q.Get("status")))
+
 	statuses := h.cfg.Pool.List()
 	out := make([]accountSummary, 0, len(statuses))
 	for _, s := range statuses {
@@ -92,7 +102,52 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, sum)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+
+	filtered := out[:0]
+	for _, sum := range out {
+		if keyword != "" && !strings.Contains(strings.ToLower(sum.UID), keyword) &&
+			!strings.Contains(strings.ToLower(sum.Nickname), keyword) &&
+			!strings.Contains(strings.ToLower(sum.Note), keyword) {
+			continue
+		}
+		if wantStatus != "" && accountStatusKey(sum) != wantStatus {
+			continue
+		}
+		filtered = append(filtered, sum)
+	}
+
+	total := len(filtered)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts":  filtered[start:end],
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+		"pages":     (total + pageSize - 1) / pageSize,
+	})
+}
+
+// accountStatusKey 归一化账号状态标签（与前端徽章口径一致），供 ?status= 过滤。
+func accountStatusKey(s accountSummary) string {
+	switch {
+	case s.Disabled:
+		return "disabled"
+	case !s.Enabled:
+		return "off"
+	case s.Paused:
+		return "paused"
+	case s.Cooling:
+		return "cooling"
+	default:
+		return "ok"
+	}
 }
 
 // importRequest 导入请求体。

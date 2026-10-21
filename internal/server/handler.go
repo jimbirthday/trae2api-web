@@ -56,6 +56,10 @@ type Handler struct {
 	cfg Config
 	mux *http.ServeMux
 
+	// credits 额度快照缓存（见 admin.go）。放在 Handler 上而不是全局变量，
+	// 这样多个 handler 实例（测试）之间互不干扰。
+	credits creditsCache
+
 	// Web 登录 pending 态：pendingID → 登录进行中的临时上下文。
 	// 回调 /authorize 捕获后标记成功；面板轮询 result 取结果。
 	loginMu sync.Mutex

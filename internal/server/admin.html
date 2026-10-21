@@ -75,6 +75,17 @@
                  border-radius:8px; color:var(--fg); padding:10px 12px; font-size:12px;
                  font-family:Consolas,monospace; resize:vertical; }
   .imp-row { display:flex; gap:10px; align-items:flex-start; margin-top:8px; flex-wrap:wrap; }
+  /* 分页器 */
+  .pager { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:14px 0 6px; font-size:12px; color:var(--dim); }
+  .pgbtn { background:var(--card2); border:1px solid #2a2f3a; color:var(--fg); border-radius:6px;
+           padding:4px 10px; font-size:12px; cursor:pointer; transition:.15s; font-family:inherit; }
+  .pgbtn:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  .pgbtn:disabled { opacity:.35; cursor:not-allowed; }
+  .pgbtn.on { background:#1c3a5a; border-color:var(--accent); color:var(--accent); }
+  .pager select { background:var(--card); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
+                  padding:3px 6px; font-size:12px; font-family:inherit; }
+  select.imp { min-height:auto; background:var(--card); border:1px solid #2a2f3a; border-radius:8px;
+               color:var(--fg); padding:7px 10px; font-size:12px; font-family:inherit; }
   /* modal */
   .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
   .modal-bg.show { display:flex; }
@@ -94,7 +105,7 @@
     <h1>trae2api-web 控制台<small>凭证管理 · 额度监控</small></h1>
     <div class="toolbar">
       <span id="ts"></span>
-      <button class="btn" onclick="refreshActive()">刷新</button>
+      <button class="btn" onclick="refreshActive(true)">刷新</button>
     </div>
   </header>
 
@@ -148,7 +159,25 @@
       </div>
     </div>
 
+    <div class="login-bar">
+      <h2>账号列表</h2>
+      <div class="imp-row" style="margin-top:0">
+        <input class="imp" id="acctQ" placeholder="搜索 uid / 昵称 / 备注" style="min-height:auto;width:240px" oninput="acctFilterChanged()" onkeydown="if(event.key==='Enter'){acctFilterChanged()}">
+        <select class="imp" id="acctStatus" onchange="acctFilterChanged()">
+          <option value="">全部状态</option>
+          <option value="ok">正常</option>
+          <option value="cooling">冷却中</option>
+          <option value="paused">已暂停选号</option>
+          <option value="off">已停用</option>
+          <option value="disabled">禁用(session dead)</option>
+        </select>
+        <button class="btn" onclick="loadAccounts(true)">刷新列表</button>
+        <span id="acctMeta" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+    </div>
+
     <div id="acctTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
+    <div id="pgAccts" class="pager"></div>
   </div>
 
   <!-- 请求流水 -->
@@ -156,14 +185,16 @@
     <div class="login-bar">
       <h2>请求流水与指标</h2>
       <div class="imp-row">
-        <input class="imp" style="min-height:auto;width:180px" id="fUid" placeholder="uid 过滤">
-        <input class="imp" style="min-height:auto;width:180px" id="fModel" placeholder="model 过滤">
-        <input class="imp" style="min-height:auto;width:140px" id="fOutcome" placeholder="outcome">
-        <button class="btn" onclick="loadRequests()">查询</button>
+        <input class="imp" style="min-height:auto;width:180px" id="fUid" placeholder="uid 过滤" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
+        <input class="imp" style="min-height:auto;width:180px" id="fModel" placeholder="model 过滤" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
+        <input class="imp" style="min-height:auto;width:140px" id="fOutcome" placeholder="outcome" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
+        <button class="btn" onclick="loadRequests(true)">查询</button>
+        <button class="btn" onclick="clearReqFilters()">清空条件</button>
       </div>
       <div id="metricsLine" class="login-status" style="display:none"></div>
     </div>
     <div id="reqTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
+    <div id="pgReqs" class="pager"></div>
   </div>
 
   <!-- 用量统计 -->
@@ -184,11 +215,24 @@
     </div>
     <div class="grid" id="usageKpi" style="margin-bottom:14px"></div>
     <div id="usageTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
+    <div id="pgUsage" class="pager"></div>
   </div>
 
   <!-- 额度监控 -->
   <div id="pane-credits" class="pane">
-    <div class="grid" id="grid"><div style="color:var(--dim)"><span class="spin"></span> 切换到「账号管理」tab 查看详情，或点刷新</div></div>
+    <div class="login-bar">
+      <h2>额度与签到</h2>
+      <div class="imp-row" style="margin-top:0">
+        <button class="btn primary" onclick="loadCredits(true)">实时查询上游</button>
+        <span id="creditMeta" class="login-status" style="margin:0;display:none"></span>
+      </div>
+      <div style="color:var(--dim);font-size:11px;margin-top:8px;line-height:1.7">
+        每个账号每次刷新要请求上游 2 次（额度 + 签到），因此服务端缓存 <b>60 秒</b>：
+        切 tab、翻页都走缓存，只有点「实时查询上游」才会真正打上游。
+      </div>
+    </div>
+    <div class="grid" id="grid"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
+    <div id="pgCredits" class="pager"></div>
   </div>
 </div>
 
@@ -204,6 +248,88 @@
 <script>
 let activeTab = 'accounts';
 let loginPollTimer = null;
+
+/* ─── 通用：请求缓存 + 竞态防护 + 分页器 ───
+   apiGet 的语义：
+     - 同一 URL 的并发请求合并成一次（快速切 tab 不再打出多份）
+     - 结果缓存 ttl 毫秒；force=true 绕过缓存
+     - 每个视图一个 AbortController：切走时旧请求作废，避免慢请求回来覆盖新结果 */
+const apiCache = new Map();      // url -> {at, data}
+const apiInflight = new Map();   // url -> Promise
+const viewAbort = {};            // view -> AbortController
+
+function abortView(view){
+  const c = viewAbort[view];
+  if(c){ c.abort(); delete viewAbort[view]; }
+  return new AbortController();
+}
+function viewSignal(view){
+  if(!viewAbort[view]) viewAbort[view] = new AbortController();
+  return viewAbort[view].signal;
+}
+const viewSeq = {};               // view -> 最近一次请求序号（用于丢弃过期结果）
+function staleError(){ const e = new Error('stale'); e.name = 'AbortError'; return e; }
+
+async function apiGet(url, view, ttl, force){
+  ttl = ttl || 0;
+  const seq = view ? (viewSeq[view] = (viewSeq[view]||0) + 1) : 0;
+
+  if(!force){
+    const c = apiCache.get(url);
+    if(c && (Date.now() - c.at) < ttl) return c.data;
+    const p = apiInflight.get(url);
+    if(p){ const d = await p; if(view && seq !== viewSeq[view]) throw staleError(); return d; }
+  }
+  const p = (async ()=>{
+    const r = await fetch(url, {cache:'no-store', signal: view? viewSignal(view): undefined});
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(apiErr(d));
+    apiCache.set(url, {at: Date.now(), data: d});
+    return d;
+  })();
+  apiInflight.set(url, p);
+  try {
+    const d = await p;
+    // 同一视图内快速连续翻页时，只让「最后一次点击」的结果上屏。
+    if(view && seq !== viewSeq[view]) throw staleError();
+    return d;
+  } finally { apiInflight.delete(url); }
+}
+function invalidate(prefix){
+  for(const k of Array.from(apiCache.keys())){ if(k.startsWith(prefix)) apiCache.delete(k); }
+}
+
+/* 分页器：容器 id + 页码 + 每页 + 总数（total<0 表示未知，退化为相对翻页） */
+function renderPager(elId, page, pageSize, total, onGo, extra){
+  const el = document.getElementById(elId);
+  if(!el) return;
+  const known = total >= 0;
+  const pages = known ? Math.max(1, Math.ceil(total / pageSize)) : 0;
+  let html = '';
+  html += '<button class="pgbtn" onclick="'+onGo+'('+(page-1)+')"'+(page<=1?' disabled':'')+'>上一页</button>';
+  if(known){
+    // 最多显示 7 个页码，当前页居中
+    let from = Math.max(1, page-3), to = Math.min(pages, from+6);
+    from = Math.max(1, to-6);
+    if(from > 1) html += '<button class="pgbtn" onclick="'+onGo+'(1)">1</button>'+(from>2?'<span>…</span>':'');
+    for(let i=from; i<=to; i++){
+      html += '<button class="pgbtn'+(i===page?' on':'')+'" onclick="'+onGo+'('+i+')">'+i+'</button>';
+    }
+    if(to < pages) html += (to<pages-1?'<span>…</span>':'')+'<button class="pgbtn" onclick="'+onGo+'('+pages+')">'+pages+'</button>';
+  } else {
+    html += '<span style="padding:0 6px">第 '+page+' 页（带过滤条件时总数未知）</span>';
+  }
+  html += '<button class="pgbtn" onclick="'+onGo+'('+(page+1)+')"'+(known && page>=pages?' disabled':'')+'>下一页</button>';
+  html += '<span style="margin-left:6px">共 '+(known? fmt(total) : '?')+' 条';
+  if(known) html += ' · 第 '+page+'/'+pages+' 页';
+  html += '</span>';
+  html += '<span style="margin-left:auto">每页 <select onchange="'+onGo+'(1, this.value)">';
+  for(const n of [10,20,50,100,200]){
+    html += '<option value="'+n+'"'+(n===pageSize?' selected':'')+'>'+n+'</option>';
+  }
+  html += '</select> 条</span>';
+  el.innerHTML = html + (extra||'');
+}
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function badge(text, cls){ return '<span class="badge '+cls+'">'+esc(text)+'</span>'; }
@@ -248,35 +374,67 @@ async function logout(){
 })();
 
 function switchTab(name, el){
+  if(activeTab && activeTab !== name) abortView(activeTab); // 作废上一个 tab 的在途请求
   activeTab = name;
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   el.classList.add('active');
   document.querySelectorAll('.pane').forEach(p=>p.classList.remove('active'));
   document.getElementById('pane-'+name).classList.add('active');
-  refreshActive();
+  refreshActive(false);
 }
-function refreshActive(){
-  if(activeTab==='accounts') loadAccounts();
-  else if(activeTab==='credits') loadCredits();
-  else if(activeTab==='usage') loadUsage();
-  else loadRequests();
+function refreshActive(force){
+  if(activeTab==='accounts') loadAccounts(force);
+  else if(activeTab==='credits') loadCredits(!!force); // 切 tab 走缓存，点刷新才打上游
+  else if(activeTab==='usage') loadUsage(force);
+  else loadRequests(false);
 }
 
 /* ─── 账号管理 ─── */
-async function loadAccounts(){
+const acctState = { page:1, pageSize:20, total:0 };
+let acctFilterTimer = null;
+function acctFilterChanged(){
+  if(acctFilterTimer) clearTimeout(acctFilterTimer);
+  acctFilterTimer = setTimeout(()=>{ acctState.page = 1; loadAccounts(true); }, 250); // 输入防抖
+}
+function gotoAccts(page, pageSize){
+  if(pageSize) acctState.pageSize = Number(pageSize)||20;
+  acctState.page = Math.max(1, page||1);
+  loadAccounts(true);
+}
+async function loadAccounts(force){
+  const q = new URLSearchParams();
+  q.set('page', acctState.page);
+  q.set('page_size', acctState.pageSize);
+  const kw = (document.getElementById('acctQ')||{}).value;
+  const stq = (document.getElementById('acctStatus')||{}).value;
+  if(kw && kw.trim()) q.set('q', kw.trim());
+  if(stq) q.set('status', stq);
+  const el = document.getElementById('acctTable');
   try{
-    const r = await fetch('/admin/api/accounts', {cache:'no-store'});
-    const d = await r.json();
+    const d = await apiGet('/admin/api/accounts?'+q.toString(), 'accounts', 3000, force);
+    acctState.total = (d.total==null? (d.accounts||[]).length : d.total);
+    acctState.page = d.page || acctState.page;
+    acctState.pageSize = d.page_size || acctState.pageSize;
     renderAccounts(d.accounts||[]);
+    const meta = document.getElementById('acctMeta');
+    if(meta) meta.textContent = '共 '+fmt(acctState.total)+' 个账号';
+    renderPager('pgAccts', acctState.page, acctState.pageSize, acctState.total, 'gotoAccts');
     document.getElementById('ts').textContent = '更新于 ' + new Date().toLocaleTimeString();
   }catch(e){
-    document.getElementById('acctTable').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'（服务是否在运行？）</div>';
+    if(e.name === 'AbortError') return;
+    el.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'（服务是否在运行？）</div>';
   }
 }
 function renderAccounts(accts){
   const el = document.getElementById('acctTable');
   if(!accts.length){
-    el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无账号，点上方「添加账号」登录，或粘贴回调链接导入。</div>';
+    const kw = (document.getElementById('acctQ')||{}).value || '';
+    const stq = (document.getElementById('acctStatus')||{}).value || '';
+    let msg;
+    if(kw.trim() || stq) msg = '没有符合条件的账号（清空上方搜索/状态过滤后重试）。';
+    else if(acctState.page > 1) msg = '当前页没有数据（页码超出范围）。';
+    else msg = '暂无账号，点上方「添加账号」登录，或粘贴回调链接导入。';
+    el.innerHTML = '<div style="color:var(--dim);padding:14px">'+msg+'</div>';
     return;
   }
   let rows = accts.map(a=>{
@@ -321,15 +479,17 @@ async function toggleAcct(uid, enabled){
     method:'PATCH', headers:{'Content-Type':'application/json', ...authHeader()},
     body: JSON.stringify({enabled: enabled})
   });
-  if(!r.ok){ const e = await r.json().catch(()=>({})); alert('切换失败：'+apiErr(e)); loadAccounts(); return; }
-  loadAccounts();
+  invalidate('/admin/api/accounts');
+  if(!r.ok){ const e = await r.json().catch(()=>({})); alert('切换失败：'+apiErr(e)); loadAccounts(true); return; }
+  loadAccounts(true);
 }
 async function refreshAcct(uid){
   const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/refresh', {
     method:'POST', headers: authHeader()
   });
   if(!r.ok){ const e = await r.json().catch(()=>({})); alert('刷新失败：'+apiErr(e)); }
-  loadAccounts();
+  invalidate('/admin/api/accounts');
+  loadAccounts(true);
 }
 async function deleteAcct(uid){
   if(!confirm('确认删除账号 '+uid+'？将同时删除 auths 文件（不可逆）。')) return;
@@ -337,7 +497,8 @@ async function deleteAcct(uid){
     method:'DELETE', headers: authHeader()
   });
   if(!r.ok){ const e = await r.json().catch(()=>({})); alert('删除失败：'+apiErr(e)); }
-  loadAccounts();
+  invalidate('/admin/api/accounts');
+  loadAccounts(true);
 }
 async function showJSON(uid){
   const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store'});
@@ -358,16 +519,16 @@ async function post(path, payload){
 }
 async function balanceAcct(uid){
   const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/balance');
-  if(d){ loadAccounts(); }
+  if(d){ invalidate('/admin/api/accounts'); invalidate('/admin/api/credits'); loadAccounts(true); }
 }
 async function pauseAcct(uid, pause){
   const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+(pause?'/pause':'/resume'));
-  if(d){ loadAccounts(); }
+  if(d){ invalidate('/admin/api/accounts'); loadAccounts(true); }
 }
 async function reviveAcct(uid){
   if(!confirm('复活账号 '+uid+'？将同时清除冷却/熔断/降权状态。')) return;
   const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/revive');
-  if(d){ loadAccounts(); }
+  if(d){ invalidate('/admin/api/accounts'); loadAccounts(true); }
 }
 async function editProfile(uid){
   const w = prompt('调度权重（1-100，1 = 不干预，数字越大越优先）','1');
@@ -375,13 +536,13 @@ async function editProfile(uid){
   const n = prompt('备注（纯展示）','');
   if(n===null) return;
   const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/profile', {weight: Number(w)||1, note: n});
-  if(d){ loadAccounts(); }
+  if(d){ invalidate('/admin/api/accounts'); loadAccounts(true); }
 }
 async function bulk(action){
   const st = document.getElementById('bulkStatus');
   st.style.display=''; st.className='login-status'; st.textContent='执行中...';
   const d = await post('/admin/api/accounts/set_all', {action});
-  if(d){ st.className='login-status ok'; st.textContent='已处理 '+d.changed+' 个账号'; loadAccounts(); }
+  if(d){ st.className='login-status ok'; st.textContent='已处理 '+d.changed+' 个账号'; invalidate('/admin/api/accounts'); loadAccounts(true); }
   else { st.className='login-status err'; st.textContent='失败'; }
 }
 async function checkinAll(){
@@ -392,20 +553,33 @@ async function checkinAll(){
     const ok = (d.accounts||[]).filter(a=>!a.error).length;
     st.className='login-status ok';
     st.textContent = '完成：成功 '+ok+' / '+(d.accounts||[]).length;
-    loadAccounts();
+    invalidate('/admin/api/accounts'); invalidate('/admin/api/credits'); loadAccounts(true);
   } else { st.className='login-status err'; st.textContent='失败'; }
 }
 
 /* ─── 用量统计 ─── */
 function pct(v){ return (v==null||v===0)?'-':Number(v).toFixed(1)+'%'; }
 function cpm(v){ return (v==null||v===0)?'-':Number(v).toFixed(1); }
-async function loadUsage(){
+const usageState = { page:1, pageSize:50, total:0, sort:'requests' };
+function gotoUsage(page, pageSize){
+  if(pageSize) usageState.pageSize = Number(pageSize)||50;
+  usageState.page = Math.max(1, page||1);
+  loadUsage(true);
+}
+function sortUsage(key){
+  usageState.sort = key;
+  usageState.page = 1;
+  loadUsage(true);
+}
+async function loadUsage(force){
   const el = document.getElementById('usageTable');
   const meta = document.getElementById('usageMeta');
+  const q = new URLSearchParams();
+  q.set('page', usageState.page);
+  q.set('page_size', usageState.pageSize);
+  q.set('sort', usageState.sort);
   try{
-    const r = await fetch('/admin/api/usage', {cache:'no-store'});
-    const d = await r.json().catch(()=>({}));
-    if(!r.ok){ el.innerHTML = '<div style="color:var(--bad)">'+esc(apiErr(d))+'</div>'; return; }
+    const d = await apiGet('/admin/api/usage?'+q.toString(), 'usage', 5000, force);
     if(!d.enabled){
       el.innerHTML = '<div style="color:var(--dim);padding:14px">用量统计未启用（config.usage.enabled=false）。</div>';
       return;
@@ -414,8 +588,15 @@ async function loadUsage(){
     meta.className='login-status';
     meta.textContent = '统计自 ' + new Date(d.snapshot.started_at).toLocaleString()
       + ' · 积分采样' + (d.credit_sampling_enabled ? '已启用（' + d.snapshot.credit_sampling_interval_sec + 's 节流）' : '已关闭');
+    usageState.total = (d.total==null? (d.snapshot.models||[]).length : d.total);
+    usageState.page = d.page || usageState.page;
+    usageState.pageSize = d.page_size || usageState.pageSize;
     renderUsage(d.snapshot);
-  }catch(e){ el.innerHTML='<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>'; }
+    renderPager('pgUsage', usageState.page, usageState.pageSize, usageState.total, 'gotoUsage');
+  }catch(e){
+    if(e.name === 'AbortError') return;
+    el.innerHTML='<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+  }
 }
 function renderUsage(snap){
   const el = document.getElementById('usageTable');
@@ -432,15 +613,17 @@ function renderUsage(snap){
       + card('整体平均积分 / 百万 token', cpm(t.credits_per_million),
              t.credit_samples?('采样 '+fmt(t.credit_samples)+' 次 · 累计 '+(t.sampled_credits||0).toFixed(2)+' 积分'):'窗口未满，暂无采样')
       + card('累计请求', fmt(t.requests),
-             rows.length+' 个模型 · 总计 '+fmt(t.total_tokens||0)+' tokens');
+             fmt(usageState.total)+' 个模型 · 总计 '+fmt(t.total_tokens||0)+' tokens');
   }
   if(!rows.length){
     el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无用量数据（发一次对话后即有）。</div>';
     return;
   }
+  const sortBtn = (key, label) => '<th style="cursor:pointer;user-select:none" onclick="sortUsage(\''+key+'\')" title="点击排序">'
+    + label + (usageState.sort===key? ' ↓':'')+'</th>';
   let html = '<table class="accts"><thead><tr>'
-    + '<th>模型</th><th>请求</th><th>输入 token</th><th>输出 token</th>'
-    + '<th>缓存命中</th><th>缓存率</th><th>积分/百万 token</th><th>采样</th>'
+    + sortBtn('model','模型')+sortBtn('requests','请求')+sortBtn('tokens','输入 token')
+    + '<th>输出 token</th><th>缓存命中</th>'+sortBtn('cache','缓存率')+sortBtn('credits','积分/百万 token')+'<th>采样</th>'
     + '</tr></thead><tbody>';
   for(const m of rows){
     html += '<tr>'
@@ -455,8 +638,8 @@ function renderUsage(snap){
       + '</tr>';
   }
   // 合计行（加权，不是简单平均）
-  html += '<tr style="border-top:2px solid var(--line);font-weight:600">'
-    + '<td>'+(esc(t.model)||'合计')+'</td>'
+  html += '<tr style="border-top:2px solid #3a4152;font-weight:600">'
+    + '<td>'+(esc(t.model)||'合计')+' <span style="font-size:11px;color:var(--dim);font-weight:400">（全量）</span></td>'
     + '<td class="mono">'+fmt(t.requests)+'</td>'
     + '<td class="mono">'+fmt(t.prompt_tokens||0)+'</td>'
     + '<td class="mono">'+fmt(t.completion_tokens||0)+'</td>'
@@ -469,7 +652,8 @@ function renderUsage(snap){
 }
 
 /* ─── 请求流水 ─── */
-async function loadRequests(){
+const reqState = { page:1, pageSize:50, total:-1 };
+function reqFilters(){
   const q = new URLSearchParams();
   const uid = document.getElementById('fUid').value.trim();
   const model = document.getElementById('fModel').value.trim();
@@ -477,11 +661,28 @@ async function loadRequests(){
   if(uid) q.set('uid', uid);
   if(model) q.set('model', model);
   if(outcome) q.set('outcome', outcome);
-  q.set('limit','200');
+  return q;
+}
+function clearReqFilters(){
+  document.getElementById('fUid').value='';
+  document.getElementById('fModel').value='';
+  document.getElementById('fOutcome').value='';
+  reqState.page = 1;
+  loadRequests(true);
+}
+function gotoReqs(page, pageSize){
+  if(pageSize) reqState.pageSize = Number(pageSize)||50;
+  reqState.page = Math.max(1, page||1);
+  loadRequests(true);
+}
+async function loadRequests(force){
+  const q = reqFilters();
+  const offset = (reqState.page - 1) * reqState.pageSize;
+  q.set('offset', offset);
+  q.set('limit', reqState.pageSize);
   const el = document.getElementById('reqTable');
   try{
-    const r = await fetch('/admin/api/requests?'+q.toString(), {cache:'no-store'});
-    const d = await r.json();
+    const d = await apiGet('/admin/api/requests?'+q.toString(), 'requests', 2000, force);
     const ml = document.getElementById('metricsLine');
     ml.style.display='';
     if(!d.enabled){
@@ -493,9 +694,15 @@ async function loadRequests(){
     ml.textContent = '总计 '+fmt(m.total)+' · 成功 '+fmt(m.succeeded)+' · 失败 '+fmt(m.failed)
       + ' · 换号 '+fmt(m.rotates)+' · 平均延迟 '+fmt(Math.round(m.avg_latency_ms||0))+'ms'
       + ' · 成功率 '+((m.success_rate||0)*100).toFixed(1)+'%'
-      + ' · 在途 '+fmt(m.in_flight);
+      + ' · 在途 '+fmt(m.in_flight)
+      + (d.archive? ' · 归档 '+fmt(d.archive.files)+' 文件 / '+(d.archive.bytes/1048576).toFixed(1)+'MB':'');
+    // total=-1 表示带过滤条件时不做全量扫描（总数未知），分页器退化为相对翻页。
+    reqState.total = (d.total==null? -1 : d.total);
+    reqState.page = Math.floor((d.offset||0)/(d.limit||reqState.pageSize)) + 1;
+    if(d.limit) reqState.pageSize = d.limit;
     const evs = d.events||[];
-    if(!evs.length){ el.innerHTML='<div style="color:var(--dim);padding:14px">暂无记录</div>'; return; }
+    renderPager('pgReqs', reqState.page, reqState.pageSize, reqState.total, 'gotoReqs');
+    if(!evs.length){ el.innerHTML='<div style="color:var(--dim);padding:14px">'+(reqState.page>1?'该页没有记录':'暂无记录')+'</div>'; return; }
     el.innerHTML = '<table class="accts"><thead><tr><th>时间</th><th>模型</th><th>账号</th><th>状态</th><th>结果</th>'
       + '<th>延迟</th><th>tokens</th><th>换号</th></tr></thead><tbody>'
       + evs.map(e=>{
@@ -513,7 +720,10 @@ async function loadRequests(){
             + '</tr>';
         }).join('')
       + '</tbody></table>';
-  }catch(e){ el.innerHTML='<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>'; }
+  }catch(e){
+    if(e.name === 'AbortError') return;
+    el.innerHTML='<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+  }
 }
 
 /* ─── 导入 ─── */
@@ -639,7 +849,7 @@ function pollLogin(pid){
         st.className='login-status ok';
         st.textContent='登录成功：'+(d.nickname||'')+'（'+(d.uid||'')+'）';
         document.getElementById('loginBtn').disabled=false;
-        loadAccounts();
+        invalidate('/admin/api/accounts'); loadAccounts(true);
       } else if(d.state==='failed'){
         clearInterval(loginPollTimer);
         st.className='login-status err';
@@ -682,17 +892,43 @@ function renderCredits(d){
       + '</div>';
   }).join('');
 }
-async function loadCredits(){
+const creditState = { page:1, pageSize:30, total:0 };
+function gotoCredits(page, pageSize){
+  if(pageSize) creditState.pageSize = Number(pageSize)||30;
+  creditState.page = Math.max(1, page||1);
+  loadCredits(false);
+}
+async function loadCredits(force){
+  const q = new URLSearchParams();
+  q.set('page', creditState.page);
+  q.set('page_size', creditState.pageSize);
+  if(force) q.set('refresh','1');
+  const grid = document.getElementById('grid');
+  const meta = document.getElementById('creditMeta');
+  if(meta){ meta.style.display=''; meta.className='login-status'; meta.textContent = force? '正在查询上游…':'加载中…'; }
   try{
-    const r = await fetch('/admin/api/credits', {cache:'no-store'});
-    renderCredits(await r.json());
+    // 强制刷新前先丢掉客户端旧缓存，否则翻到第 2 页又会拿到 60 秒前的数据。
+    if(force) invalidate('/admin/api/credits');
+    const d = await apiGet('/admin/api/credits?'+q.toString(), 'credits', 60000, !!force);
+    creditState.total = (d.total==null? (d.accounts||[]).length : d.total);
+    creditState.page = d.page || creditState.page;
+    creditState.pageSize = d.page_size || creditState.pageSize;
+    renderCredits(d);
+    renderPager('pgCredits', creditState.page, creditState.pageSize, creditState.total, 'gotoCredits');
+    if(meta){
+      meta.className='login-status';
+      meta.textContent = '数据时间 '+d.fetched_at + (d.cached? '（缓存，60 秒内不重复查询上游）':'（实时）')
+        + ' · 共 '+fmt(creditState.total)+' 个账号';
+    }
   }catch(e){
-    document.getElementById('grid').innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+    if(e.name === 'AbortError') return;
+    grid.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
+    if(meta) meta.textContent = '';
   }
 }
 
 /* 初始 */
-loadAccounts();
+loadAccounts(true);
 </script>
 </body>
 </html>

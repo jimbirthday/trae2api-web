@@ -198,42 +198,90 @@ func (h *Handler) adminCheckinAll(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }
 
-// adminRequests GET /admin/api/requests?limit=&uid=&model=&outcome=
+// adminRequests GET /admin/api/requests?limit=&offset=&uid=&model=&outcome=
+//
+// 分页语义：offset 为「跳过最新的多少条」，offset=0 即最新一页。
+// 返回 total/精确性标记，前端据此渲染页码。
 func (h *Handler) adminRequests(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.RequestLog == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"events": []any{}, "enabled": false})
 		return
 	}
 	q := r.URL.Query()
-	limit := 200
-	if v, err := strconv.Atoi(q.Get("limit")); err == nil && v > 0 {
-		limit = v
-	}
-	if limit > 5000 {
-		limit = 5000
-	}
+	limit := clampInt(q.Get("limit"), 50, 1, 500)
+	offset := clampInt(q.Get("offset"), 0, 0, 1<<20)
 	f := reqlog.Filter{UID: q.Get("uid"), Model: q.Get("model"), Outcome: q.Get("outcome")}
+
 	// 归档是异步落盘的（有 flush 间隔），最新请求可能还在内存环形缓冲里，
-	// 因此两份合并去重后再按时间倒序截断：否则面板会「看不到刚发的请求」。
-	archived, err := h.cfg.RequestLog.ReadArchive(limit, f)
+	// 因此两份合并去重后再排序：否则面板会「看不到刚发的请求」。
+	// 只需取前 offset+limit 条——全局前 K 条必落在「内存 + 归档前 K 条」里。
+	window := offset + limit
+	archived, err := h.cfg.RequestLog.ReadArchivePage(0, window, f)
 	if err != nil {
 		archived = nil
 	}
-	events := mergeEvents(filterRecent(h.cfg.RequestLog.Recent(limit), f), archived, limit)
+	merged := mergeEvents(filterRecent(h.cfg.RequestLog.Recent(0), f), archived)
+	total, exact := h.requestsTotal(f, len(merged))
+	events := slicePage(merged, offset, limit)
+
 	writeJSON(w, http.StatusOK, map[string]any{
-		"enabled": true,
-		"events":  events,
-		"metrics": h.cfg.RequestLog.Metrics(),
-		"archive": h.cfg.RequestLog.ArchiveStats(),
+		"enabled":     true,
+		"events":      events,
+		"total":       total,
+		"total_exact": exact,
+		"offset":      offset,
+		"limit":       limit,
+		"metrics":     h.cfg.RequestLog.Metrics(),
+		"archive":     h.cfg.RequestLog.ArchiveStats(),
 	})
+}
+
+// requestsTotal 估算可翻页的总条数，并说明是否精确。
+//
+// 无过滤条件时用「归档行数（带缓存）」与「进程累计计数」取大，精确；
+// 带过滤条件时不做全量扫描，返回 -1 表示未知（前端退化为相对翻页）。
+func (h *Handler) requestsTotal(f reqlog.Filter, windowLen int) (int, bool) {
+	m := h.cfg.RequestLog.Metrics()
+	if f != (reqlog.Filter{}) {
+		if windowLen == 0 {
+			return 0, true // 首页就空，必然一条都没有
+		}
+		return -1, false
+	}
+	n := int(m.Total)
+	if archived, ok := h.cfg.RequestLog.ArchiveTotal(f); ok && int(archived) > n {
+		n = int(archived)
+	}
+	return n, true
+}
+
+// slicePage 取 [offset, offset+limit) 一段（超界返回空切片）。
+func slicePage(evs []reqlog.Event, offset, limit int) []reqlog.Event {
+	if offset >= len(evs) {
+		return []reqlog.Event{}
+	}
+	evs = evs[offset:]
+	if limit > 0 && len(evs) > limit {
+		evs = evs[:limit]
+	}
+	return evs
 }
 
 // mergeEvents 合并「内存最近事件」与「归档事件」，按 request_id 去重并按时间倒序。
 // 内存侧优先（字段更完整，且包含尚未 flush 的最新请求）。
-func mergeEvents(recent, archived []reqlog.Event, limit int) []reqlog.Event {
+func mergeEvents(recent, archived []reqlog.Event) []reqlog.Event {
 	seen := make(map[string]bool, len(recent)+len(archived))
 	out := make([]reqlog.Event, 0, len(recent)+len(archived))
-	for _, e := range append(recent, archived...) {
+	for _, e := range recent {
+		if e.RequestID != "" {
+			if seen[e.RequestID] {
+				continue
+			}
+			seen[e.RequestID] = true
+		}
+		out = append(out, e)
+	}
+	for _, e := range archived {
 		if e.RequestID != "" {
 			if seen[e.RequestID] {
 				continue
@@ -243,9 +291,6 @@ func mergeEvents(recent, archived []reqlog.Event, limit int) []reqlog.Event {
 		out = append(out, e)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time.After(out[j].Time) })
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
 	return out
 }
 
@@ -262,6 +307,21 @@ func filterRecent(events []reqlog.Event, f reqlog.Filter) []reqlog.Event {
 		out = append(out, e)
 	}
 	return out
+}
+
+// clampInt 解析查询参数为整数并夹到 [min,max]；空串/非法值取 def。
+func clampInt(raw string, def, min, max int) int {
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return def
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
 }
 
 // adminMetrics GET /admin/api/metrics：进程级请求指标。
