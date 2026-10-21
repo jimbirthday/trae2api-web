@@ -48,28 +48,54 @@ func minInt(a, b int) int {
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
-	reqID := reqlog.NewRequestID()
-	rec := &reqlog.Event{RequestID: reqID, Time: started, Path: r.URL.Path}
+	// 复用 ServeHTTP 中间件已经定好的请求 ID（客户端传了就用客户端的）。
+	// 这里再生成一个会覆盖响应头，导致「客户端拿到的 ID」与「归档里记的 ID」
+	// 不是同一个——报障时按 ID 查不到任何东西。
+	reqID := strings.TrimSpace(w.Header().Get("X-Request-ID"))
+	if reqID == "" {
+		reqID = reqlog.NewRequestID()
+		w.Header().Set("X-Request-ID", reqID)
+	}
+	rec := &reqlog.Event{
+		RequestID: reqID, Time: started, Path: r.URL.Path,
+		// 来源信息只用于排障（谁在打、哪个客户端 SDK 的 bug），不参与鉴权。
+		ClientIP:  chatClientIP(r),
+		UserAgent: logfmt.Truncate(r.UserAgent(), 200),
+	}
 
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes+1))
 	if err != nil {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
+		rec.Outcome = reqlog.OutcomeHTTPError
+		rec.Status = http.StatusBadRequest
+		rec.Error = sanitizeErrMsg("read body: " + err.Error())
+		writeChatError(w, rec, http.StatusBadRequest, "invalid_request", "read body: "+sanitizeErrMsg(err.Error()))
 		return
 	}
 	if len(body) > maxBodyBytes {
-		writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
+		rec.Outcome = reqlog.OutcomeHTTPError
+		rec.Status = http.StatusRequestEntityTooLarge
+		writeChatError(w, rec, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds 8MB limit")
 		return
 	}
 	var peek struct {
 		Stream bool   `json:"stream"`
 		Model  string `json:"model"`
+		// Messages 只做「非空」校验：空 messages 上游会直接 4xx，
+		// 我们提前拦下能给出更准确的 OpenAI 语义错误码。
+		Messages []json.RawMessage `json:"messages"`
 		// StreamOptions 只需读 include_usage：OpenAI 规定该标志为 true 时，
 		// 才在 [DONE] 前追加一个只带 usage 的 chunk。
 		StreamOptions struct {
 			IncludeUsage bool `json:"include_usage"`
 		} `json:"stream_options"`
 	}
-	_ = json.Unmarshal(body, &peek)
+	if err := json.Unmarshal(body, &peek); err != nil {
+		rec.Outcome = reqlog.OutcomeHTTPError
+		rec.Status = http.StatusBadRequest
+		rec.Error = "body is not valid JSON"
+		writeChatError(w, rec, http.StatusBadRequest, "invalid_request", "request body is not valid JSON: "+sanitizeErrMsg(err.Error()))
+		return
+	}
 	rec.Stream = peek.Stream
 	rec.Model = peek.Model
 	defer func() {
@@ -77,11 +103,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		h.recordRequest(rec)
 	}()
 
+	if len(peek.Messages) == 0 {
+		// OpenAI 语义：messages 必填且非空。发到上游只会换回一个含义模糊的 4xx，
+		// 还会白白消耗一次账号调用与额度。
+		rec.Outcome = reqlog.OutcomeHTTPError
+		rec.Status = http.StatusBadRequest
+		rec.Error = "messages must be a non-empty array"
+		writeChatError(w, rec, http.StatusBadRequest, "invalid_request", "messages must be a non-empty array")
+		return
+	}
+
 	configName, err := h.mapModel(peek.Model)
 	if err != nil {
 		rec.Outcome = reqlog.OutcomeHTTPError
+		rec.Status = http.StatusBadRequest
 		rec.Error = err.Error()
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeChatError(w, rec, http.StatusBadRequest, "model_not_found", err.Error())
 		return
 	}
 	body = setModelInBody(body, configName)
@@ -128,6 +165,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		sse = upstream.NewSSEWriter(w, sseModel)
 		sse.StartHeartbeat(h.cfg.StreamHeartbeat)
+		// 响应头已经 flush 出去了，真实状态码就是 200；否则流水里会留下
+		// status=0 的「离线错误」，跟 HTTP 语义对不上，面板也会误判。
+		rec.Status = http.StatusOK
 	}
 	defer func() {
 		if sse != nil {
@@ -161,7 +201,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		rec.Nickname = acct.Nickname
 
 		// 在途租约：Pick 已过滤满额账号，此处 CAS 兜底并发抢名额的竞态。
-		if !h.cfg.Pool.Acquire(acct.UID) {
+		// 用带令牌的版本：同一账号并发多个请求时，A 请求的归还绝不能减掉
+		// B 请求占的名额（旧的无令牌 Release 会这么做，实际并发上限会失效）。
+		leaseToken, leaseOK := h.cfg.Pool.AcquireLease(acct.UID)
+		if !leaseOK {
 			if stickyUID == acct.UID {
 				unbindSticky()
 			}
@@ -180,7 +223,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// token 临近过期 → 先刷新（失败则冷却换号）。
 		if refreshed, rerr := h.cfg.Upstream.RefreshTokenIfNeeded(acct, h.cfg.RefreshSkew); rerr != nil {
-			h.cfg.Pool.Release(acct.UID)
+			h.cfg.Pool.ReleaseToken(leaseToken)
 			lastErr = rerr
 			var ue *upstream.Error
 			if errors.As(rerr, &ue) && ue.Kind == upstream.ErrSessionDead {
@@ -208,16 +251,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if terr != nil {
 			// 超时 / 客户端断连：不是账号的问题，换号只会拖长请求并误罚健康号。
 			if upstream.IsUpstreamTimeout(terr) || upstream.IsClientGone(terr) || r.Context().Err() != nil {
-				h.cfg.Pool.Release(acct.UID)
+				h.cfg.Pool.ReleaseToken(leaseToken)
 				// 只计数、不罚号：不喂 NoteError（不计熔断额度）、不喂 NoteFailures（不降权）。
 				h.cfg.Pool.NoteTransportError(acct.UID)
 				lastErr = terr
-				rec.Error = terr.Error()
+				rec.Error = sanitizeErrMsg(terr.Error())
 				log.Printf("WARN: [server] upstream timeout/client-gone acct=%s: %v (account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
 				break
 			}
-			h.cfg.Pool.Release(acct.UID)
+			h.cfg.Pool.ReleaseToken(leaseToken)
 			h.cfg.Pool.NoteFailures(acct.UID)
 			h.cfg.Pool.NoteError(acct.UID)
 			lastErr = terr
@@ -232,7 +275,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if status >= 400 {
 			// 上游已返回错误响应体（ChatStream 已关闭 body），立即归还租约，
 			// 否则该号会一直被算作「在途占满」而再也选不中（严重泄漏）。
-			h.cfg.Pool.Release(acct.UID)
+			h.cfg.Pool.ReleaseToken(leaseToken)
 			lastErr = h.penalizeHTTP(acct, status, respBody, configName, retryAfter)
 			if lastErr != nil {
 				var ue *upstream.Error
@@ -257,13 +300,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 成功：先占住租约，直到响应体完全消费/流结束再释放。
+		// 以下进入「上游已接受请求」阶段：租约保持占用，直到响应体消费完再释放。
 		if peek.Stream {
-			bindSticky()
-			h.cfg.Pool.NoteSuccess(acct.UID)
-			rec.Status = http.StatusOK
 			openStream() // 理论上已开；防御性兜底
-			err := sse.Run(rc, upstream.StreamOptions{
+			// usage 先暂存、等 Run 返回后按最终结果记账。
+			// 为什么不在 OnUsage 里直接落库：上游可能先发 token_usage 再发
+			// event:error，这个失败的尝试会被换号重试；若当场记账，同一次用户
+			// 请求就会被计两遍 token（面板/计费都虚高）。
+			var pendUsage upstream.UsageDetail
+			hasPendUsage := false
+			runErr := sse.Run(rc, upstream.StreamOptions{
 				// 把请求的模型名写进每个 chunk：上游 metadata 的 model 常为空，
 				// 留空会让客户端无法按模型统计/显示。
 				Model: sseModel,
@@ -271,43 +317,86 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				Thinking: h.cfg.StreamThinking,
 				// usage chunk 只在客户端显式要求时下发（OpenAI stream_options 语义）。
 				IncludeUsage: peek.StreamOptions.IncludeUsage,
+				// 关键：错误帧由本函数在「确认不能换号」之后再写。
+				// 上游空流/截断/event:error 时我们还有机会换号重试，
+				// 若 Run 抢先写 error 帧+[DONE]，客户端已经结束解析，
+				// 重试出来的正文就变成孤儿帧。
+				SuppressErrorFrame: true,
 				OnError: func(se *upstream.SOLOStreamError) {
 					h.handleStreamError(acct.UID, configName, se)
 				},
 				OnUsage: func(d upstream.UsageDetail) {
-					// 流式 usage 记账：与非流式保持对称（含缓存/思考链/延迟）。
-					h.recordUsageDetail(acct.UID, configName, d, time.Since(started), rec)
-					h.noteCreditCompletion(acct.UID, configName, d.TotalTokens)
+					pendUsage, hasPendUsage = d, true
 				},
 			})
 			rc.Close()
-			h.cfg.Pool.Release(acct.UID)
+			h.cfg.Pool.ReleaseToken(leaseToken)
 			// 流式耗时拆解落进请求流水：面板据此区分「上游慢」与「我们慢」。
 			// 必须在 Run 返回后取快照（它已停止更新）；此时 rec 的 usage 字段
 			// 也已由 OnUsage 回填，可以算 TPS。
 			st := sse.Stats()
+			// 有内容或整条流正常收尾，这次用量才算数（失败的尝试已经换号重试）。
+			if hasPendUsage && (runErr == nil || st.HasOutput()) {
+				h.recordUsageDetail(acct.UID, configName, pendUsage, time.Since(started), rec)
+				h.noteCreditCompletion(acct.UID, configName, pendUsage.TotalTokens)
+			}
 			applyStreamStats(rec, st)
 			// 按模型聚合吞吐：与请求流水用同一个快照，口径完全一致。
 			// 放在 Run 返回后（此时 OnUsage 已回填 completion_tokens），
 			// 因此分子分母来自同一个请求。
-			if h.cfg.Usage != nil && st.HasTiming {
+			// 只统计真正下发过内容的流：空流/截断流的 gen_ms 是「等了两秒然后
+			// 断了」，把它当成一次吞吐样本会把按模型聚合的 TPS 拉偏（分母虚高、
+			// 分子为 0）。
+			if h.cfg.Usage != nil && st.HasOutput() {
 				h.cfg.Usage.AddTiming(configName, rec.CompletionTokens, st.GenMs,
 					st.FirstTextMs, st.FirstFrameMs, int64(st.ContentChars+st.ThinkChars))
 			}
-			switch {
-			case err != nil && r.Context().Err() != nil:
+
+			if runErr == nil {
+				// 只有「真的收到了内容且正常收尾」才算成功：
+				// 先记成功会让坏号被粘性钉死，后续同一会话的请求全部失败。
+				bindSticky()
+				h.cfg.Pool.NoteSuccess(acct.UID)
+				rec.Status = http.StatusOK
+				rec.Outcome = reqlog.OutcomeSuccess
+				return
+			}
+
+			if r.Context().Err() != nil {
 				// 客户端主动断连（用户关闭/取消）：不算上游失败，也不罚号。
 				rec.Outcome = reqlog.OutcomeInterrupted
-			case err != nil:
-				rec.Outcome = reqlog.OutcomeStreamError
-				rec.Error = err.Error()
-			default:
-				rec.Outcome = reqlog.OutcomeSuccess
+				rec.Error = sanitizeErrMsg(runErr.Error())
+				return
 			}
+
+			// 上游失败。若客户端还没收到任何正文/思考/工具调用，
+			// 说明这次尝试对外是不可见的 —— 可以安全换号重试。
+			if !st.HasOutput() {
+				if stickyUID == acct.UID {
+					unbindSticky()
+				}
+				lastErr = runErr
+				h.penalizeStreamFailure(acct, runErr)
+				rec.Error = sanitizeErrMsg(runErr.Error())
+				log.Printf("WARN: [server] stream failed before any output acct=%s model=%s: %v",
+					logfmt.Label(acct.UID, acct.Nickname), configName, runErr)
+				if !rotateBackoff(rotates, r.Context()) {
+					break
+				}
+				rotates++
+				rec.Rotates = rotates
+				continue
+			}
+
+			// 已经下发过内容：换号会让客户端看到「两段拼接」的回复，
+			// 只能就地收尾报错（error 帧 + [DONE]）。
+			rec.Outcome = reqlog.OutcomeStreamError
+			rec.Error = sanitizeErrMsg(runErr.Error())
+			sse.WriteError(publicStreamErrMsg(runErr))
 			return
 		}
 
-		resp, aerr := upstream.Aggregate(rc)
+		resp, aerr := upstream.AggregateWithModel(rc, sseModel)
 		rc.Close()
 		// 同流式：usage 记账与积分采样都要在 Release 前完成。
 		var usageDetail upstream.UsageDetail
@@ -322,16 +411,31 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			h.recordUsageDetail(acct.UID, configName, usageDetail, time.Since(started), rec)
 			h.noteCreditCompletion(acct.UID, configName, usageDetail.TotalTokens)
 		}
-		h.cfg.Pool.Release(acct.UID)
+		h.cfg.Pool.ReleaseToken(leaseToken)
 		if aerr != nil {
 			var se *upstream.SOLOStreamError
 			if errors.As(aerr, &se) {
 				lastErr = aerr
 				h.handleStreamError(acct.UID, configName, se)
-				if se.Kind() == upstream.ErrSoftRate {
+				// 与非流式的流内错误判定保持一致：一律走 KindFor（模型级规则优先），
+				// 两处用不同口径会让同一个错误在流式/非流式下罚到不同的状态机。
+				if se.KindFor(h.cfg.Upstream) == upstream.ErrSoftRate {
 					lastRateLimited = true
 				}
-				rec.Error = aerr.Error()
+				rec.Error = sanitizeErrMsg(aerr.Error())
+				if !rotateBackoff(rotates, r.Context()) {
+					break
+				}
+				rotates++
+				rec.Rotates = rotates
+				continue
+			}
+			// 空流 / 截断流 / 上游 5xx 之外的协议异常：都不是「请求本身有问题」，
+			// 换个号往往就能成，所以这里继续轮转而不是直接 502。
+			if errors.Is(aerr, upstream.ErrEmptyCompletion) || errors.Is(aerr, upstream.ErrTruncatedStream) {
+				lastErr = aerr
+				h.penalizeStreamFailure(acct, aerr)
+				rec.Error = sanitizeErrMsg(aerr.Error())
 				if !rotateBackoff(rotates, r.Context()) {
 					break
 				}
@@ -340,8 +444,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			rec.Outcome = reqlog.OutcomeStreamError
-			rec.Error = aerr.Error()
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", aerr.Error())
+			rec.Error = sanitizeErrMsg(aerr.Error())
+			writeChatError(w, rec, http.StatusBadGateway, "upstream_parse", aerr.Error())
 			return
 		}
 		bindSticky()
@@ -357,18 +461,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 账号都在，但每个号都对该模型处于模型级冷却：语义不同，需明确区分。
 		msg = fmt.Sprintf("model %q is blocked on all accounts until %s",
 			configName, mb.Until.Format(time.RFC3339))
-		writeOpenAIError(w, http.StatusServiceUnavailable, "model_blocked", msg)
+		writeChatError(w, rec, http.StatusServiceUnavailable, "model_blocked", msg)
 		rec.Outcome = reqlog.OutcomeHTTPError
 		rec.Status = http.StatusServiceUnavailable
-		rec.Error = msg
+		rec.Error = sanitizeErrMsg(msg)
 		return
 	}
 	if lastErr != nil {
-		msg += ": " + lastErr.Error()
+		// 上游原始错误里可能带内部 URL / biz code / 响应体片段：只进日志与流水，
+		// 不直接回给客户端。
+		rec.Error = sanitizeErrMsg(msg + ": " + lastErr.Error())
+		msg += ": " + publicStreamErrMsg(lastErr)
 	}
 	rec.Outcome = reqlog.OutcomeHTTPError
 	rec.Status = http.StatusServiceUnavailable
-	rec.Error = msg
+	if rec.Error == "" {
+		rec.Error = msg
+	}
 	// 流已经开出去（响应头 200 已发），状态码改不动了：用流内 error 事件
 	// 收尾，客户端才会立刻报错而不是一直挂着等 token。
 	if sse != nil {
@@ -376,7 +485,118 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		sse.WriteError(msg)
 		return
 	}
-	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
+	writeChatError(w, rec, http.StatusServiceUnavailable, "no_healthy_account", msg)
+}
+
+// chatClientIP 取真实客户端 IP：X-Forwarded-For 首段 → X-Real-IP → RemoteAddr。
+//
+// 自包含实现（不复用 admin 侧的 clientIP）：这条路径是所有外部请求都要走的，
+// 不能因为后台模块重构而连带编译/语义风险；nginx 默认只设 X-Real-IP，
+// 只认 XFF 会让日志里的来源永远是反代 IP。
+func chatClientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i >= 0 {
+			v = v[:i]
+		}
+		if v = strings.TrimSpace(v); v != "" {
+			return logfmt.Truncate(v, 64)
+		}
+	}
+	if v := strings.TrimSpace(r.Header.Get("X-Real-IP")); v != "" {
+		return logfmt.Truncate(v, 64)
+	}
+	host := r.RemoteAddr
+	if i := strings.LastIndexByte(host, ':'); i > 0 {
+		host = host[:i]
+	}
+	return logfmt.Truncate(strings.Trim(host, "[]"), 64)
+}
+
+// openAIErrType 把 HTTP 状态码映射成 OpenAI 规范的 error.type。
+//
+// 为什么不能一律 api_error：客户端（尤其官方 SDK 与带重试逻辑的网关）会按
+// type 决定行为 —— rate_limit_error 才退避重试，invalid_request_error 重试
+// 无意义，authentication_error 要提示用户换 key。全给 api_error 会让他们
+// 对「400 参数错」做无意义的指数退避，对「429」反而不退避。
+func openAIErrType(status int) string {
+	switch {
+	case status == http.StatusUnauthorized:
+		return "authentication_error"
+	case status == http.StatusForbidden:
+		return "permission_error"
+	case status == http.StatusNotFound:
+		return "not_found_error"
+	case status == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case status == http.StatusBadRequest || status == http.StatusUnprocessableEntity ||
+		status == http.StatusRequestEntityTooLarge:
+		return "invalid_request_error"
+	case status >= 500:
+		return "api_error"
+	default:
+		return "api_error"
+	}
+}
+
+// writeChatError 写 OpenAI 风格错误响应，并带上请求 ID 便于与流水对齐。
+func writeChatError(w http.ResponseWriter, rec *reqlog.Event, status int, code, msg string) {
+	msg = sanitizeErrMsg(msg)
+	if rec != nil && rec.RequestID != "" {
+		w.Header().Set("X-Request-ID", rec.RequestID)
+	}
+	// 只用 OpenAI schema 定义的四个键：严格校验的 SDK 会拒绝未知字段。
+	// 请求 ID 放在 X-Request-ID 头里（上面已设），不塞进 error 对象。
+	writeJSON(w, status, map[string]any{
+		"error": map[string]any{
+			"message": msg,
+			"type":    openAIErrType(status),
+			"param":   nil,
+			"code":    code,
+		},
+	})
+}
+
+// publicStreamErrMsg 决定「已经下发过内容」之后写给客户端的错误文案。
+//
+// 上游原始错误可能带内部 URL、biz code、甚至响应体片段，直接透给客户端既
+// 泄露实现细节，也无助于用户。这里只按类别给一句话，细节留在日志与流水里。
+func publicStreamErrMsg(err error) string {
+	switch {
+	case errors.Is(err, upstream.ErrStreamIdleTimeout):
+		return "upstream stalled (no data within idle timeout); please retry"
+	case errors.Is(err, upstream.ErrTruncatedStream):
+		return "upstream closed the stream before completion; please retry"
+	case errors.Is(err, upstream.ErrEmptyCompletion):
+		return "upstream returned an empty completion; please retry"
+	}
+	var se *upstream.SOLOStreamError
+	if errors.As(err, &se) {
+		// 只回业务码：上游 message 里可能带内部路由/账号标识，留在日志与流水里。
+		return fmt.Sprintf("upstream solo error (code=%d); please retry", se.Code)
+	}
+	return "upstream stream failed; please retry"
+}
+
+// penalizeStreamFailure 处置「还没向客户端下发任何内容」的流内失败。
+//
+// 与 penalizeHTTP 的分工：这里没有 HTTP 状态码，只有错误对象。口径：
+//   - 空闲超时：上游自己挂住了，不罚号（只计数），换号试下一个；
+//   - 空流/截断：上游收下请求却没给结果，按可重试错误轻度计数；
+//   - event:error：已由 OnError 回调按模型级规则/plan/rate 处置过，不重复罚。
+func (h *Handler) penalizeStreamFailure(acct *auth.Auth, err error) {
+	uid := acct.UID
+	if errors.Is(err, upstream.ErrStreamIdleTimeout) || errors.Is(err, upstream.ErrEmptyCompletion) ||
+		errors.Is(err, upstream.ErrTruncatedStream) {
+		// 这三类都可能是上游侧抖动：计失败数用于降权，但不进熔断额度，
+		// 避免一次上游抽风把整池账号打进熔断。
+		h.cfg.Pool.NoteTransportError(uid)
+		return
+	}
+	var se *upstream.SOLOStreamError
+	if errors.As(err, &se) {
+		return // OnError 已经按分类处置（模型级冷却/plan/rate）
+	}
+	h.cfg.Pool.NoteError(uid)
 }
 
 // penalizeHTTP 按 HTTP 错误分类处置账号，返回带分类的 error（供外层决定是否继续轮转）。

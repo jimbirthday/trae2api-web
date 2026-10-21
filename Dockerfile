@@ -23,7 +23,11 @@ COPY config.example.json /app/config.example.json
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 ENV TZ=Asia/Shanghai
-EXPOSE 8000
+# 8000 = 主服务；18080 = TRAE 登录回调（可用 TW2A_CALLBACK_BIND/PORT 调整）
+EXPOSE 8000 18080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8000/healthz >/dev/null || exit 1
+# Go 服务自己处理 SIGTERM 做优雅停机（15s 收尾在途请求 + flush 持久化），
+# 必须让信号直达 PID 1（entrypoint 用 exec 转交，不额外 fork）。
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

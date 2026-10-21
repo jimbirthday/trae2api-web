@@ -194,7 +194,9 @@ func TestExtractKeyPriorities(t *testing.T) {
 		body string
 		want string
 	}{
-		{"user field", `{"user":"u-1","messages":[{"role":"user","content":"hi"}]}`, "user:u-1"},
+		// user 字段不再直接当键：必须与内容一起 hash，否则同一客户端复用的 user 值
+		// 会让不同对话互相抢绑定。
+		{"user field", `{"user":"u-1","messages":[{"role":"user","content":"hi"}]}`, ExtractKeyFromFields(KeyFields{User: "u-1", FirstUser: "hi"})},
 		{"empty body", ``, ""},
 		{"invalid json", `{`, ""},
 		{"no messages", `{"model":"x"}`, ""},
@@ -228,6 +230,29 @@ func TestExtractKeyPriorities(t *testing.T) {
 	full := ExtractKey([]byte(`{"messages":[{"role":"assistant","content":"only assistant"}]}`))
 	if full == "" {
 		t.Fatal("expected fallback hash for messages without user text")
+	}
+}
+
+// 键必须有足够熵：不能是固定常量，也不能让不同会话撞到同一个键。
+func TestExtractKeyHasNoConstantCollision(t *testing.T) {
+	// 无任何可推导信号时必须返回空串（不粘），而不是 "default" 这类共享常量。
+	if got := ExtractKey([]byte(`{"model":"x"}`)); got != "" {
+		t.Fatalf("no signal should yield empty key, got %q", got)
+	}
+	if got := ExtractKey([]byte(`{"messages":[]}`)); got != "" {
+		t.Fatalf("empty messages should yield empty key, got %q", got)
+	}
+	// 同一 user 值 + 不同对话内容 → 不同键。
+	a := ExtractKey([]byte(`{"user":"u","messages":[{"role":"user","content":"topic A"}]}`))
+	b := ExtractKey([]byte(`{"user":"u","messages":[{"role":"user","content":"topic B"}]}`))
+	if a == "" || b == "" || a == b {
+		t.Fatalf("same user different topic collided: %q vs %q", a, b)
+	}
+	// conversationId 优先，且不同会话不撞。
+	c1 := ExtractKey([]byte(`{"metadata":{"conversation_id":"c1"},"messages":[{"role":"user","content":"x"}]}`))
+	c2 := ExtractKey([]byte(`{"metadata":{"conversation_id":"c2"},"messages":[{"role":"user","content":"x"}]}`))
+	if c1 == "" || c2 == "" || c1 == c2 {
+		t.Fatalf("different conversations collided: %q vs %q", c1, c2)
 	}
 }
 

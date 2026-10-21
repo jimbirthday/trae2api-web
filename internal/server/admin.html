@@ -113,6 +113,9 @@
     <span>API Key：</span>
     <input id="apikey" type="password" placeholder="TW2A_API_KEY（会话失效后需重新填写）" oninput="onKeyChange()">
     <button class="btn sm" onclick="saveKey()">应用</button>
+    <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--dim);cursor:pointer">
+      <input type="checkbox" id="rememberKey" style="width:auto;margin:0"> 记住（存本地）
+    </label>
     <span id="keystatus" class="saved" style="display:none">已应用</span>
     <button class="btn sm" onclick="logout()">退出登录</button>
     <span style="margin-left:auto;font-size:11px">面板与全部接口均需鉴权</span>
@@ -187,7 +190,13 @@
       <div class="imp-row">
         <input class="imp" style="min-height:auto;width:180px" id="fUid" placeholder="uid 过滤" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
         <input class="imp" style="min-height:auto;width:180px" id="fModel" placeholder="model 过滤" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
-        <input class="imp" style="min-height:auto;width:140px" id="fOutcome" placeholder="outcome" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
+        <select class="imp" style="min-height:auto;width:150px" id="fOutcome" onchange="reqState.page=1;loadRequests(true)">
+          <option value="">全部结果</option>
+          <option value="success">success（成功）</option>
+          <option value="http_error">http_error（HTTP 错误）</option>
+          <option value="stream_error">stream_error（流内错误）</option>
+          <option value="interrupted">interrupted（客户端中断）</option>
+        </select>
         <button class="btn" onclick="loadRequests(true)">查询</button>
         <button class="btn" onclick="clearReqFilters()">清空条件</button>
       </div>
@@ -302,36 +311,58 @@ function invalidate(prefix){
 }
 
 /* 分页器：容器 id + 页码 + 每页 + 总数（total<0 表示未知，退化为相对翻页） */
+/* 分页器：容器 id + 页码 + 每页 + 总数（total<0 表示未知，退化为相对翻页）
+   按钮全部用 data-page / data-size 承载参数，点击由事件委托统一处理——
+   不把任何变量拼进内联 onclick，避免动态数据逃逸成可执行脚本。 */
 function renderPager(elId, page, pageSize, total, onGo, extra){
   const el = document.getElementById(elId);
   if(!el) return;
+  el.dataset.ongo = onGo;              // 分页回调函数名（代码常量，非用户数据）
   const known = total >= 0;
   const pages = known ? Math.max(1, Math.ceil(total / pageSize)) : 0;
   let html = '';
-  html += '<button class="pgbtn" onclick="'+onGo+'('+(page-1)+')"'+(page<=1?' disabled':'')+'>上一页</button>';
+  html += '<button class="pgbtn" data-page="'+(page-1)+'"'+(page<=1?' disabled':'')+'>上一页</button>';
   if(known){
     // 最多显示 7 个页码，当前页居中
     let from = Math.max(1, page-3), to = Math.min(pages, from+6);
     from = Math.max(1, to-6);
-    if(from > 1) html += '<button class="pgbtn" onclick="'+onGo+'(1)">1</button>'+(from>2?'<span>…</span>':'');
+    if(from > 1) html += '<button class="pgbtn" data-page="1">1</button>'+(from>2?'<span>…</span>':'');
     for(let i=from; i<=to; i++){
-      html += '<button class="pgbtn'+(i===page?' on':'')+'" onclick="'+onGo+'('+i+')">'+i+'</button>';
+      html += '<button class="pgbtn'+(i===page?' on':'')+'" data-page="'+i+'">'+i+'</button>';
     }
-    if(to < pages) html += (to<pages-1?'<span>…</span>':'')+'<button class="pgbtn" onclick="'+onGo+'('+pages+')">'+pages+'</button>';
+    if(to < pages) html += (to<pages-1?'<span>…</span>':'')+'<button class="pgbtn" data-page="'+pages+'">'+pages+'</button>';
   } else {
     html += '<span style="padding:0 6px">第 '+page+' 页（带过滤条件时总数未知）</span>';
   }
-  html += '<button class="pgbtn" onclick="'+onGo+'('+(page+1)+')"'+(known && page>=pages?' disabled':'')+'>下一页</button>';
+  html += '<button class="pgbtn" data-page="'+(page+1)+'"'+(known && page>=pages?' disabled':'')+'>下一页</button>';
   html += '<span style="margin-left:6px">共 '+(known? fmt(total) : '?')+' 条';
   if(known) html += ' · 第 '+page+'/'+pages+' 页';
   html += '</span>';
-  html += '<span style="margin-left:auto">每页 <select onchange="'+onGo+'(1, this.value)">';
+  html += '<span style="margin-left:auto">每页 <select class="pgsize">';
   for(const n of [10,20,50,100,200]){
     html += '<option value="'+n+'"'+(n===pageSize?' selected':'')+'>'+n+'</option>';
   }
   html += '</select> 条</span>';
   el.innerHTML = html + (extra||'');
 }
+
+/* 分页事件委托：所有分页容器共用一个监听。 */
+document.addEventListener('click', function(e){
+  const btn = e.target.closest ? e.target.closest('.pgbtn[data-page]') : null;
+  if(!btn || btn.disabled) return;
+  const box = btn.parentElement;
+  const fn = box && box.dataset ? box.dataset.ongo : '';
+  const cb = fn && window[fn];
+  if(typeof cb === 'function') cb(Number(btn.dataset.page)||1);
+});
+document.addEventListener('change', function(e){
+  const sel = e.target;
+  if(!sel || !sel.classList || !sel.classList.contains('pgsize')) return;
+  const box = sel.parentElement && sel.parentElement.parentElement;
+  const fn = box && box.dataset ? box.dataset.ongo : '';
+  const cb = fn && window[fn];
+  if(typeof cb === 'function') cb(1, sel.value);
+});
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function badge(text, cls){ return '<span class="badge '+cls+'">'+esc(text)+'</span>'; }
@@ -360,19 +391,30 @@ async function saveKey(){
     alert('Key 不正确：'+apiErr(d));
     return;
   }
-  localStorage.setItem('tw2a_admin_key', k);
+  // 默认只写 sessionStorage（关标签页即失效，缩小凭据暴露面）；
+  // 勾选「记住」才落盘到 localStorage（明文本地存储，谨慎使用）。
+  sessionStorage.setItem('tw2a_admin_key', k);
+  if(document.getElementById('rememberKey') && document.getElementById('rememberKey').checked){
+    localStorage.setItem('tw2a_admin_key', k);
+  } else {
+    localStorage.removeItem('tw2a_admin_key');
+  }
   const s = document.getElementById('keystatus');
   s.style.display=''; s.textContent='已应用';
   setTimeout(()=>location.reload(), 300);
 }
 async function logout(){
   await fetch('/admin/api/session', {method:'DELETE'});
+  sessionStorage.removeItem('tw2a_admin_key');
   localStorage.removeItem('tw2a_admin_key');
   location.reload();
 }
 (function loadKey(){
-  const k = localStorage.getItem('tw2a_admin_key') || '';
-  if(k){ document.getElementById('apikey').value = k; }
+  const mem = sessionStorage.getItem('tw2a_admin_key') || '';
+  const disk = localStorage.getItem('tw2a_admin_key') || '';
+  const k = mem || disk;
+  if(k){ document.getElementById('apikey').value = k; sessionStorage.setItem('tw2a_admin_key', k); }
+  if(disk && document.getElementById('rememberKey')) document.getElementById('rememberKey').checked = true;
 })();
 
 function switchTab(name, el){
@@ -459,16 +501,18 @@ function renderAccounts(accts){
       + '<td class="mono">'+esc(exp)+'</td>'
       + '<td class="mono">'+(a.in_flight||0)+' / '+(a.max_in_flight||0)+'</td>'
       + '<td class="mono">'+esc(a.weight||1)+'</td>'
-      + '<td><div class="row-actions">'
-      + '<label class="toggle"><input type="checkbox" '+toggleChecked+' '+toggleDisabled+' onchange="toggleAcct(\''+esc(a.uid)+'\', this.checked)"><span class="slider"></span></label>'
-      + '<button class="btn sm" onclick="refreshAcct(\''+esc(a.uid)+'\')">刷新token</button>'
-      + '<button class="btn sm" onclick="balanceAcct(\''+esc(a.uid)+'\')">刷额度</button>'
-      + (a.disabled ? '<button class="btn sm" onclick="reviveAcct(\''+esc(a.uid)+'\')">复活</button>' : '')
-      + '<button class="btn sm" onclick="pauseAcct(\''+esc(a.uid)+'\', '+(a.paused?'false':'true')+')">'+(a.paused?'恢复选号':'暂停选号')+'</button>'
-      + '<button class="btn sm" onclick="editProfile(\''+esc(a.uid)+'\')">权重/备注</button>'
-      + '<button class="btn sm" onclick="testAcct(\''+esc(a.uid)+'\')">测试</button>'
-      + '<button class="btn sm" onclick="showJSON(\''+esc(a.uid)+'\')">JSON</button>'
-      + '<button class="btn sm danger" onclick="deleteAcct(\''+esc(a.uid)+'\')">删除</button>'
+      // UID 只进 data-uid 属性（HTML 转义），绝不拼进内联 onclick 的 JS 字符串：
+      // esc() 会把 ' 转成 &#39;，浏览器解析后仍是 '，可闭合字符串执行脚本（存储型 XSS）。
+      + '<td><div class="row-actions" data-uid="'+esc(a.uid)+'" data-paused="'+(a.paused?'1':'0')+'">'
+      + '<label class="toggle"><input type="checkbox" data-act="toggle" '+toggleChecked+' '+toggleDisabled+'><span class="slider"></span></label>'
+      + '<button class="btn sm" data-act="refresh">刷新token</button>'
+      + '<button class="btn sm" data-act="balance">刷额度</button>'
+      + (a.disabled ? '<button class="btn sm" data-act="revive">复活</button>' : '')
+      + '<button class="btn sm" data-act="pause">'+(a.paused?'恢复选号':'暂停选号')+'</button>'
+      + '<button class="btn sm" data-act="profile">权重/备注</button>'
+      + '<button class="btn sm" data-act="test">测试</button>'
+      + '<button class="btn sm" data-act="json">JSON</button>'
+      + '<button class="btn sm danger" data-act="delete">删除</button>'
       + '</div></td>'
       + '</tr>';
   }).join('');
@@ -476,6 +520,39 @@ function renderAccounts(accts){
     + '<th>账号</th><th>状态</th><th>积分</th><th>Token 有效期</th><th>在途</th><th>权重</th><th style="text-align:right">操作</th>'
     + '</tr></thead><tbody>'+rows+'</tbody></table>';
 }
+/* 账号行操作：事件委托。UID 从 closest('[data-uid]').dataset 读取，
+   任何动态数据都不进 JS 字符串字面量（防存储型 XSS）。 */
+function acctAct(e){
+  const el = e.target.closest ? e.target.closest('[data-act]') : null;
+  if(!el) return;
+  // 开关走 change（点击 checkbox 会先 click 再 change，只处理一次，避免重复 PATCH）
+  if(el.dataset.act === 'toggle' && e.type === 'click') return;
+  const box = el.closest('[data-uid]');
+  if(!box) return;
+  const uid = box.dataset.uid || '';
+  if(!uid) return;
+  const paused = box.dataset.paused === '1';
+  switch(el.dataset.act){
+    case 'toggle':   toggleAcct(uid, !!el.checked); break;
+    case 'refresh':  refreshAcct(uid); break;
+    case 'balance':  balanceAcct(uid); break;
+    case 'revive':   reviveAcct(uid); break;
+    case 'pause':    pauseAcct(uid, !paused); break;
+    case 'profile':  editProfile(uid); break;
+    case 'test':     testAcct(uid); break;
+    case 'json':     showJSON(uid); break;
+    case 'delete':   deleteAcct(uid); break;
+  }
+}
+(function bindAcctDelegation(){
+  const tbl = document.getElementById('acctTable');
+  if(!tbl) return;
+  tbl.addEventListener('click', acctAct);
+  tbl.addEventListener('change', function(e){
+    if(e.target && e.target.dataset && e.target.dataset.act === 'toggle') acctAct(e);
+  });
+})();
+
 async function toggleAcct(uid, enabled){
   const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid), {
     method:'PATCH', headers:{'Content-Type':'application/json', ...authHeader()},
@@ -520,8 +597,14 @@ async function post(path, payload){
   return d;
 }
 async function balanceAcct(uid){
-  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/balance');
-  if(d){ invalidate('/admin/api/accounts'); invalidate('/admin/api/credits'); loadAccounts(true); }
+  // 刷额度默认只更新余额（不动冷却）。要解冻需显式确认：解冻会清掉冷却/熔断/
+  // 降权状态，等于绕过调度保护，不能是「顺手点一下」的副作用。
+  const unfreeze = confirm('只刷新余额？（点【取消】则同时解除该账号的冷却/熔断/降权）\n\n账号：'+uid);
+  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/balance'+(unfreeze?'':'?apply=1'));
+  if(d){
+    invalidate('/admin/api/accounts'); invalidate('/admin/api/credits'); loadAccounts(true);
+    if(!unfreeze) alert(d.cooling_cleared ? '余额已刷新，并已解除冷却' : '余额已刷新（无可解除的冷却）');
+  }
 }
 async function pauseAcct(uid, pause){
   const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+(pause?'/pause':'/resume'));
@@ -570,6 +653,14 @@ function gotoUsage(page, pageSize){
   usageState.page = Math.max(1, page||1);
   loadUsage(true);
 }
+(function bindUsageSort(){
+  const el = document.getElementById('usageTable');
+  if(!el) return;
+  el.addEventListener('click', function(e){
+    const th = e.target.closest ? e.target.closest('th[data-sort]') : null;
+    if(th) sortUsage(th.dataset.sort);
+  });
+})();
 function sortUsage(key){
   usageState.sort = key;
   usageState.page = 1;
@@ -625,7 +716,7 @@ function renderUsage(snap){
     el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无用量数据（发一次对话后即有）。</div>';
     return;
   }
-  const sortBtn = (key, label) => '<th style="cursor:pointer;user-select:none" onclick="sortUsage(\''+key+'\')" title="点击排序">'
+  const sortBtn = (key, label) => '<th class="sortable" data-sort="'+esc(key)+'" style="cursor:pointer;user-select:none" title="点击排序">'
     + label + (usageState.sort===key? ' ↓':'')+'</th>';
   let html = '<table class="accts"><thead><tr>'
     + sortBtn('model','模型')+sortBtn('requests','请求')+sortBtn('tokens','输入 token')
@@ -731,8 +822,9 @@ async function loadRequests(force){
       + '<th title="completion_tokens / 生成时长">吞吐</th>'
       + '<th>延迟</th><th>tokens</th><th>换号</th></tr></thead><tbody>'
       + evs.map(e=>{
+          // outcome 取值与 reqlog.Outcome* 常量一一对应，只认 success 为成功。
           const ok = e.outcome==='success';
-          const cls = ok?'b-ok':'b-bad';
+          const cls = ok?'b-ok':(e.outcome==='interrupted'?'b-dim':'b-bad');
           return '<tr>'
             + '<td class="mono">'+esc(new Date(e.time).toLocaleTimeString())+'</td>'
             + '<td class="mono">'+esc(e.model||'-')+'</td>'
@@ -839,14 +931,23 @@ async function testAcct(uid){
 }
 async function exportCreds(){
   const key = getKey();
-  if(!key){ alert('导出含明文 token，需要先填 API Key'); return; }
-  const r = await fetch('/admin/api/accounts/export', {headers: authHeader(), cache:'no-store'});
+  if(!key){ alert('导出需要先填 API Key'); return; }
+  // 默认脱敏导出（只给前缀 + 长度）；明文导出是可导入的完整凭证，属于高危操作，
+  // 必须二次确认，且服务端会写审计日志。
+  const wantRaw = confirm('是否导出**明文**凭证？\n\n【取消】= 脱敏导出（安全，不能用于迁移）\n【确定】= 明文导出（可直接导入，等同交出号池）');
+  let detail = '';
+  if(wantRaw){
+    detail = prompt('明文导出确认：请输入 RAW 三个字母以继续', '');
+    if((detail||'').trim().toUpperCase() !== 'RAW'){ alert('已取消明文导出'); return; }
+  }
+  const url0 = '/admin/api/accounts/export' + (wantRaw ? '?raw=1' : '');
+  const r = await fetch(url0, {headers: authHeader(), cache:'no-store'});
   if(!r.ok){ const e = await r.json().catch(()=>({})); alert('导出失败：'+apiErr(e)); return; }
   const blob = await r.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = 'trae2api-web-accounts-'+new Date().toISOString().slice(0,10)+'.json';
+  a.download = 'trae2api-web-accounts-' + (wantRaw?'raw-':'masked-') + new Date().toISOString().slice(0,10)+'.json';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(url), 5000);
 }
@@ -860,7 +961,15 @@ async function startLogin(){
     const r = await fetch('/admin/api/login', {method:'POST', headers:{'Content-Type':'application/json', ...authHeader()}, body:'{}'});
     const d = await r.json();
     if(!r.ok){ st.className='login-status err'; st.textContent='生成失败：'+apiErr(d); btn.disabled=false; return; }
-    st.textContent = '已打开登录窗口，请在浏览器完成手机号登录。完成后此页自动刷新。';
+    if(d.warn){
+      // 回调链路可能不通（未配置 TW2A_PUBLIC_BASE_URL / Docker 下 127.0.0.1 不可达）
+      st.className='login-status err';
+      st.textContent = '已打开登录窗口，但存在风险：' + d.warn;
+      st.textContent += '\n回调地址：' + (d.callback_url||'');
+    } else {
+      st.className='login-status';
+      st.textContent = '已打开登录窗口，请在浏览器完成手机号登录。完成后此页自动刷新。';
+    }
     window.open(d.login_url, '_blank');
     pollLogin(d.pending_id);
   }catch(e){ st.className='login-status err'; st.textContent='生成失败：'+e.message; btn.disabled=false; }

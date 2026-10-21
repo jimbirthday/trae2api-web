@@ -67,20 +67,36 @@ func (e *Error) Error() string {
 var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "session", "unauthorized", "401"}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别（SPEC §4.3）。
+//
+// 业务码一律走结构化解析（bizCodeFromBody 只认 JSON 里的 code 字段）：
+// 早先用 strings.Contains(body, "1005") 判定，会把 message 里恰好出现的数字、
+// 或 11005 这类相邻码也当成 plan 权益不足，从而给健康账号打上 12h 硬冷却。
+// 只有整段 body 根本不是 JSON（网关返回的纯文本错误页）时才退回子串判断。
 func Classify(status int, body string) ErrKind {
 	lower := strings.ToLower(body)
-	// 1005 plan 权益不足
-	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
+	if code, ok := bizCodeFromBody(body); ok {
+		if code == 1005 {
+			return ErrPlanLimit
+		}
+	} else if containsBizCode(body, 1005) &&
+		(strings.Contains(lower, "plan") || strings.Contains(lower, "权益") ||
+			strings.Contains(lower, "quota") || strings.Contains(lower, "limit")) {
 		return ErrPlanLimit
 	}
-	// session 失效
 	if status == http.StatusUnauthorized {
 		for _, m := range sessionDeadMarkers {
 			if strings.Contains(lower, strings.ToLower(m)) {
 				return ErrSessionDead
 			}
 		}
-		return ErrSessionDead
+		// 401 但 body 里没有任何「会话失效」标记：
+		//   - body 为空：没有别的线索，仍按会话失效处理；
+		//   - body 有内容（参数/权限/风控提示）：按可重试的客户端错误处理，
+		//     避免把「换了号就能过」的请求打成账号永久禁用。
+		if strings.TrimSpace(body) == "" {
+			return ErrSessionDead
+		}
+		return ErrClient
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
@@ -113,6 +129,11 @@ type Client struct {
 
 	// modelRules 模型级错误规则（SetModelErrorRules 注入，默认空 = 永不触发）。
 	modelRules []ModelErrorRule
+
+	// StreamIdleTimeout 流式响应「帧间空闲」上限：距上一个字节超过该时长就
+	// 中断请求并报 ErrStreamIdleTimeout。0 表示用 DefaultStreamIdleTimeout。
+	// 负值表示关闭（仅在排查上游静默行为时使用）。
+	StreamIdleTimeout time.Duration
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -124,12 +145,19 @@ func New() *Client {
 		ResponseHeaderTimeout: 120 * time.Second, // 首字节兜底（长推理预留），不限制整流时长
 	}
 	return &Client{
-		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		StreamHTTP: &http.Client{Transport: tr}, // 无总超时
-		AgentHost:  AgentHost,
-		UgHost:     UgHost,
-		OAuthHost:  OAuthHost,
-		ClientID:   ClientID,
+		HTTP: &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		// StreamHTTP 不跟随重定向：llm_utils_chat 是 POST，3xx 被自动跟随会退化成
+		// GET（丢 body）或把网关的登录页当成流解析。交给 chatStream 显式报错，
+		// 把 Location 打出来便于判断是不是域名/入口配错了。
+		StreamHTTP: &http.Client{
+			Transport:     tr,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		AgentHost:         AgentHost,
+		UgHost:            UgHost,
+		OAuthHost:         OAuthHost,
+		ClientID:          ClientID,
+		StreamIdleTimeout: DefaultStreamIdleTimeout,
 	}
 }
 
@@ -298,6 +326,14 @@ func (c *Client) chatStream(ctx context.Context, a *auth.Auth, body []byte) (rc 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// 子 context 专供空闲看门狗取消用：超时只掐断本次请求，不影响调用方的 ctx。
+	ctx, cancel := context.WithCancel(ctx)
+	ok := false
+	defer func() {
+		if !ok {
+			cancel()
+		}
+	}()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.agentBase()+EpChat, bytes.NewReader(PrepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, 0, err
@@ -322,7 +358,29 @@ func (c *Client) chatStream(ctx context.Context, a *auth.Auth, body []byte) (rc 
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, retryAfter, nil
 	}
-	return resp.Body, resp.StatusCode, nil, 0, nil
+	// 只有 2xx 才可能承载 SSE。3xx（重定向未跟随）/204（无内容）若当成流解析，
+	// 解析器会在空 body 上读到 EOF，最终产出「成功但内容为空」的假回复。
+	switch {
+	case resp.StatusCode == http.StatusNoContent:
+		resp.Body.Close()
+		return nil, resp.StatusCode, nil, 0, fmt.Errorf("upstream returned 204 no content")
+	case resp.StatusCode >= 300:
+		loc := resp.Header.Get("Location")
+		resp.Body.Close()
+		return nil, resp.StatusCode, nil, 0, fmt.Errorf("upstream returned %d redirect (location=%q)", resp.StatusCode, truncate(loc, 200))
+	case resp.StatusCode < 200:
+		resp.Body.Close()
+		return nil, resp.StatusCode, nil, 0, fmt.Errorf("unexpected upstream status %d", resp.StatusCode)
+	}
+	idle := c.StreamIdleTimeout
+	if idle == 0 {
+		idle = DefaultStreamIdleTimeout
+	}
+	if idle < 0 {
+		idle = 0
+	}
+	ok = true
+	return newIdleTimeoutBody(resp.Body, idle, cancel), resp.StatusCode, nil, 0, nil
 }
 
 // ModelInfo 动态模型信息。

@@ -46,6 +46,13 @@ type Config struct {
 	CreditSampler *usage.Sampler
 	// ConfigPath config.json 路径（面板保存配置用；空 = 禁用写回）。
 	ConfigPath string
+	// PublicBaseURL 对外可访问的服务根地址（如 https://trae.example.com）。
+	// 用于生成 TRAE 登录回调链接 http(s)://<host>/authorize；为空时回落到
+	// http://127.0.0.1:<callback_port>/authorize（仅本机裸跑可用，Docker 下不通）。
+	PublicBaseURL string
+	// CORSOrigins 允许跨域访问 /v1/* 的来源列表；空 = "*"。
+	// 本服务用 Bearer 鉴权、不用 cookie，因此不需要 Allow-Credentials。
+	CORSOrigins []string
 }
 
 // maxBodyBytes 请求体大小上限（8MB），超过返回 413。
@@ -64,6 +71,18 @@ type Handler struct {
 	// 回调 /authorize 捕获后标记成功；面板轮询 result 取结果。
 	loginMu sync.Mutex
 	logins  map[string]*pendingLogin
+
+	// 动态模型表缓存（成功 1h / 失败负缓存 30s）。
+	// 放在 Handler 上而不是包级全局：多个 Handler 实例（测试/多 mux）互不干扰，
+	// 也避免负缓存把「刚加完号」的实例卡在空模型表里。
+	modelsMu      sync.Mutex
+	modelsIDs     []upstream.ModelInfo
+	modelsFetched time.Time
+	modelsFail    time.Time
+	modelsLoading chan struct{} // non-nil = 有 goroutine 正在拉取（singleflight）
+
+	// 面板登录爆破限流（按来源 IP 计数）。
+	loginLimiter loginLimiter
 }
 
 // NewHandler 构建 handler。
@@ -92,6 +111,7 @@ func NewHandler(cfg Config) *Handler {
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), logins: map[string]*pendingLogin{}}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
+	h.mux.HandleFunc("GET /v1/models/{id}", h.withAuth(h.modelByID))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	// 管理面板：本地面板
@@ -172,7 +192,60 @@ func (h *Handler) withAdminAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 所有响应统一带 X-Request-ID（请求头已带则沿用，便于端到端串联上游/本端日志）。
+	reqID := strings.TrimSpace(r.Header.Get("X-Request-ID"))
+	if reqID == "" {
+		reqID = newRequestID()
+	}
+	w.Header().Set("X-Request-ID", reqID)
+
+	if h.applyCORS(w, r) {
+		return // OPTIONS 预检已处理
+	}
 	h.mux.ServeHTTP(w, r)
+}
+
+// applyCORS 处理跨域：/v1/* 支持 OPTIONS 预检，返回 true 表示已响应、调用方应直接返回。
+//
+// 本服务用 Authorization: Bearer 鉴权、不依赖 cookie，因此**不**设置
+// Access-Control-Allow-Credentials: true，可以安全地用 "*" 作为默认允许来源。
+// 配置了 CORSOrigins 时按白名单回显（支持浏览器带凭据以外的场景）。
+func (h *Handler) applyCORS(w http.ResponseWriter, r *http.Request) bool {
+	// 只对 API 路径开跨域。/authorize（浏览器跳转落点，query 里带 refreshToken）
+	// 与 /admin 页面一律不加 CORS 头——回调页绝不允许被任何来源的脚本读取。
+	if !strings.HasPrefix(r.URL.Path, "/v1/") && !strings.HasPrefix(r.URL.Path, "/admin/api/") {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin != "" {
+		allow := "*"
+		if len(h.cfg.CORSOrigins) > 0 {
+			allow = ""
+			for _, o := range h.cfg.CORSOrigins {
+				if o == "*" || strings.EqualFold(o, origin) {
+					allow = o
+					break
+				}
+			}
+		}
+		if allow != "" {
+			if allow == "*" {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else {
+				w.Header().Set("Access-Control-Allow-Origin", allow)
+				w.Header().Add("Vary", "Origin")
+			}
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Request-ID")
+			w.Header().Set("Access-Control-Expose-Headers", "X-Request-ID")
+			w.Header().Set("Access-Control-Max-Age", "600")
+		}
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return true
+	}
+	return false
 }
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -236,13 +309,31 @@ func (h *Handler) mapModel(model string) (string, error) {
 	if i := strings.Index(model, "__"); i >= 0 {
 		base = model[:i]
 	}
+	// 先查静态表：静态表覆盖了全部已确认的 config_name，命中就**不必**打上游。
+	// 这条快速路径很关键——mapModel 在每个请求上都会跑，若每次都走
+	// modelList()（可能触发 FetchModels 上游调用），等于每个对话请求
+	// 额外多打一次上游模型接口，还会随机消耗一个账号的配额。
+	if id, ok := staticModelMatch(base); ok {
+		return id, nil
+	}
+	// 动态表（上游新增模型才会走到这里，且有 1h 缓存 + singleflight）。
 	if h.knownModel(base) {
 		return base, nil
 	}
-	// 宽松匹配：下划线 → 横线，大小写不敏感（deepseek_v4_pro → DeepSeek-V4-Pro）
+	// 大小写不敏感地按真实 id 匹配（绝不改写 id 本身）：
+	// 上游的 config_name 是大小写敏感的（glm-5.2 / DeepSeek-V4-Pro），
+	// 之前的「下划线分段首字母大写」规则会把 custom_model_1M 这类 id 改写成
+	// 并不存在的 Custom-Model-1m，属于有损映射。
+	if id, ok := h.knownModelFold(base); ok {
+		return id, nil
+	}
+	// 最后再试历史兼容规则（deepseek_v4_pro → DeepSeek-V4-Pro）。
 	norm := normalizeModelName(base)
-	if h.knownModel(norm) {
-		return norm, nil
+	if id, ok := staticModelMatch(norm); ok {
+		return id, nil
+	}
+	if id, ok := h.knownModelFold(norm); ok {
+		return id, nil
 	}
 	return "", fmt.Errorf("unknown model %q", model)
 }
@@ -259,7 +350,23 @@ func normalizeModelName(s string) string {
 	return strings.Join(parts, "-")
 }
 
-// knownModel 判断 model 是否在动态/静态模型表中。
+// staticModelMatch 在静态表里精确匹配（先精确、再大小写不敏感），返回原始 id。
+// 静态表是编译期常量，纯内存查表，无锁无 IO。
+func staticModelMatch(model string) (string, bool) {
+	for _, m := range staticModels {
+		if id, ok := m["id"].(string); ok && id == model {
+			return id, true
+		}
+	}
+	for _, m := range staticModels {
+		if id, ok := m["id"].(string); ok && strings.EqualFold(id, model) {
+			return id, true
+		}
+	}
+	return "", false
+}
+
+// knownModel 判断 model 是否在动态/静态模型表中（精确匹配）。
 func (h *Handler) knownModel(model string) bool {
 	for _, m := range h.modelList() {
 		if m["id"] == model {
@@ -267,6 +374,17 @@ func (h *Handler) knownModel(model string) bool {
 		}
 	}
 	return false
+}
+
+// knownModelFold 大小写不敏感匹配，返回模型表里的**原始 id**（不做任何改写）。
+// 用于兼容客户端传 glm-5.2 / GLM-5.2 这类大小写差异。
+func (h *Handler) knownModelFold(model string) (string, bool) {
+	for _, m := range h.modelList() {
+		if id, ok := m["id"].(string); ok && strings.EqualFold(id, model) {
+			return id, true
+		}
+	}
+	return "", false
 }
 
 // 静态 SOLO 模型表（SPEC P3：32 个 config_name，来自逆向报告；动态拉取失败时回退）。
@@ -305,17 +423,9 @@ var staticModels = []map[string]any{
 	{"id": "summary", "object": "model", "created": 1753600000, "owned_by": "trae-solo", "context_length": 131072},
 }
 
-// dynamicModelsCache 动态模型缓存（成功 1h / 失败负缓存 5min）。
-var dynamicModelsCache struct {
-	sync.RWMutex
-	ids      []upstream.ModelInfo
-	fetched  time.Time
-	lastFail time.Time
-}
-
 const (
 	dynamicModelsTTL        = time.Hour
-	modelsFetchFailCooldown = 5 * time.Minute
+	modelsFetchFailCooldown = 30 * time.Second // 负缓存缩短：刚加完号不该 5 分钟看不到模型
 )
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
@@ -323,6 +433,18 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 		"object": "list",
 		"data":   h.modelList(),
 	})
+}
+
+// modelByID GET /v1/models/{id}：按 id 返回单个模型对象；不存在返回 404 not_found_error。
+func (h *Handler) modelByID(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.PathValue("id"))
+	for _, m := range h.modelList() {
+		if mid, _ := m["id"].(string); mid == id {
+			writeJSON(w, http.StatusOK, m)
+			return
+		}
+	}
+	writeOpenAIError(w, http.StatusNotFound, "not_found", "model "+id+" not found")
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式；失败回退静态表。
@@ -348,38 +470,53 @@ func (h *Handler) modelList() []map[string]any {
 }
 
 // fetchDynamicModels 从池中任一健康账号拉模型列表（get_detail_param），缓存 1h。
+//
+// 并发控制用 singleflight 语义：同一时刻只允许一个 goroutine 真正打上游，
+// 其余请求阻塞等它出结果。否则 20 个并发 chat 请求会各自打一次上游模型表。
 func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
-	dynamicModelsCache.RLock()
-	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
-		dynamicModelsCache.RUnlock()
+	h.modelsMu.Lock()
+	if len(h.modelsIDs) > 0 && time.Since(h.modelsFetched) < dynamicModelsTTL {
+		out := h.modelsIDs
+		h.modelsMu.Unlock()
 		return out
 	}
-	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
-		dynamicModelsCache.RUnlock()
+	if !h.modelsFail.IsZero() && time.Since(h.modelsFail) < modelsFetchFailCooldown {
+		h.modelsMu.Unlock()
 		return nil
 	}
-	dynamicModelsCache.RUnlock()
+	if wait := h.modelsLoading; wait != nil {
+		h.modelsMu.Unlock()
+		<-wait
+		h.modelsMu.Lock()
+		out := h.modelsIDs
+		h.modelsMu.Unlock()
+		return out
+	}
+	done := make(chan struct{})
+	h.modelsLoading = done
+	h.modelsMu.Unlock()
 
 	// 用 Peek（只读选号）：拉模型表是辅助调用，不能提交 lastUsed/usedSeq，
 	// 否则每个 chat 请求都会因 mapModel→knownModel→modelList 触发一次隐式选号，
 	// 污染闲置补偿并让轮换次序错乱。
-	acct := h.cfg.Pool.Peek("")
-	if acct == nil {
-		return nil
+	var infos []upstream.ModelInfo
+	if acct := h.cfg.Pool.Peek(""); acct != nil {
+		if got, err := h.cfg.Upstream.FetchModels(acct); err == nil && len(got) > 0 {
+			infos = got
+		}
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
-		dynamicModelsCache.Lock()
-		dynamicModelsCache.lastFail = time.Now()
-		dynamicModelsCache.Unlock()
-		return nil
+
+	h.modelsMu.Lock()
+	if len(infos) > 0 {
+		h.modelsIDs = infos
+		h.modelsFetched = time.Now()
+		h.modelsFail = time.Time{}
+	} else {
+		h.modelsFail = time.Now()
 	}
-	dynamicModelsCache.Lock()
-	dynamicModelsCache.ids = infos
-	dynamicModelsCache.fetched = time.Now()
-	dynamicModelsCache.lastFail = time.Time{}
-	dynamicModelsCache.Unlock()
+	h.modelsLoading = nil
+	h.modelsMu.Unlock()
+	close(done)
 	return infos
 }
 
@@ -412,12 +549,44 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(raw)
 }
 
+// writeOpenAIError 按 OpenAI 规范写错误体。
+//
+// type 依据 code 前缀映射（OpenAI 的 error.type 是稳定枚举，客户端按它分支），
+// code 原样回显本服务的细分码，便于排查。
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
+	// code 映射不出来时，再用 HTTP 状态兜底（chat 路径的 openAIErrType 口径一致）。
+	t := openAIErrorType(code)
+	if t == "api_error" {
+		t = openAIErrType(status)
+	}
 	writeJSON(w, status, map[string]any{
 		"error": map[string]any{
 			"message": msg,
-			"type":    "api_error",
+			"type":    t,
 			"code":    code,
 		},
 	})
+}
+
+// openAIErrorType 把本服务的细分 code 映射到 OpenAI 的 error.type 枚举。
+func openAIErrorType(code string) string {
+	c := strings.ToLower(strings.TrimSpace(code))
+	switch {
+	case strings.HasPrefix(c, "invalid_api_key"), strings.HasPrefix(c, "authentication"),
+		c == "unauthorized", strings.HasPrefix(c, "invalid_token"):
+		return "authentication_error"
+	case strings.HasPrefix(c, "permission"), strings.HasPrefix(c, "forbidden"):
+		return "permission_error"
+	case strings.HasPrefix(c, "not_found"):
+		return "not_found_error"
+	case strings.HasPrefix(c, "rate_limit"):
+		return "rate_limit_error"
+	case strings.HasPrefix(c, "invalid_request"), strings.HasPrefix(c, "invalid_"),
+		c == "bad_request", strings.HasPrefix(c, "import_failed"):
+		return "invalid_request_error"
+	case strings.HasPrefix(c, "model_not_found"), strings.HasPrefix(c, "unknown_model"):
+		return "invalid_request_error"
+	default:
+		return "api_error"
+	}
 }

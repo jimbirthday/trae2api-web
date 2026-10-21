@@ -263,10 +263,132 @@ func TestReviveClearsAllBlockingState(t *testing.T) {
 		t.Fatal("revive failed")
 	}
 	st, _ := p.Status("u1")
-	if st.Cooling || st.Disabled || st.Paused || !st.BreakerUntil.IsZero() || !st.DegradeUntil.IsZero() {
-		t.Fatalf("revive left blocking state: %+v", st)
+	if st.Cooling || st.Disabled || !st.BreakerUntil.IsZero() || !st.DegradeUntil.IsZero() {
+		t.Fatalf("revive left automatic blocking state: %+v", st)
 	}
+	// 人工 Pause 必须保留：复活是「解除自动判定」，不是「无视运维意图」。
+	if !st.Paused {
+		t.Fatalf("revive must preserve manual pause: %+v", st)
+	}
+	if p.Pick() != nil {
+		t.Fatal("paused account must not be routable")
+	}
+	p.Resume("u1")
 	if p.Pick() == nil {
-		t.Fatal("account should be routable right after revive")
+		t.Fatal("account should be routable after resume")
+	}
+}
+
+// 余额回血只解「额度型」冷却，绝不能清掉熔断/软退避/连败降权这些失败率信号。
+func TestReenableOnlyClearsCreditCooldown(t *testing.T) {
+	p := newTestPool(t)
+	addAcct(p, "u1", 0)
+	p.Cooldown("u1", CoolPlan, time.Hour, "plan 权益不足")
+	p.NoteError("u1")
+	p.NoteError("u1")
+	p.NoteError("u1") // 达阈值 → 熔断
+	p.NoteFailures("u1")
+	p.NoteFailures("u1") // 达阈值 → 降权
+
+	if cleared := p.ReenableIfCredits("u1", 500); !cleared {
+		t.Fatal("plan cooldown should be cleared after credits back")
+	}
+	// 账号级冷却（e.until/coolKind）必须被清掉；剩余阻塞来自熔断/降权（下面的断言）。
+	p.mu.RLock()
+	e := p.byUID["u1"]
+	untilZero, kindEmpty := e.until.IsZero(), e.coolKind == ""
+	p.mu.RUnlock()
+	if !untilZero || !kindEmpty {
+		t.Fatalf("credit cooldown not cleared: untilZero=%v kindEmpty=%v", untilZero, kindEmpty)
+	}
+	st, _ := p.Status("u1")
+	if st.BreakerUntil.IsZero() || st.BreakerFails == 0 {
+		t.Fatalf("breaker must survive credit refresh: %+v", st)
+	}
+	if st.DegradeUntil.IsZero() {
+		t.Fatalf("degrade must survive credit refresh: %+v", st)
+	}
+	if st.SoftStreak != 0 { // 未进入软冷却，仅确认没被写脏
+		t.Fatalf("soft streak unexpected: %d", st.SoftStreak)
+	}
+}
+
+// 429 软冷却不能被额度回血解除（旧实现会顺手清掉，等于查询即放行）。
+func TestReenableDoesNotClearSoftRateCooldown(t *testing.T) {
+	p := newTestPool(t)
+	addAcct(p, "u1", 0)
+	p.CooldownSoftRate("u1", time.Minute, time.Time{}, "429")
+	if cleared := p.ReenableIfCredits("u1", 999); cleared {
+		t.Fatal("soft-rate cooldown must not be cleared by credit refresh")
+	}
+	st, _ := p.Status("u1")
+	if st.Until.IsZero() || st.CoolKind != CoolSoft.String() {
+		t.Fatalf("soft cooldown lost: %+v", st)
+	}
+}
+
+// 被动查询余额只能改数值，不能迁移任何状态。
+func TestUpdateCreditsFromQueryHasNoSideEffects(t *testing.T) {
+	p := newTestPool(t)
+	addAcct(p, "u1", 0)
+	p.Cooldown("u1", CoolPlan, time.Hour, "plan")
+	p.NoteError("u1")
+	p.NoteError("u1")
+	p.NoteError("u1")
+
+	before, _ := p.Status("u1")
+	p.UpdateCreditsFromQuery("u1", 1200, 4800)
+	after, _ := p.Status("u1")
+	if after.Credits != 1200 || after.CreditsTotal != 4800 {
+		t.Fatalf("credits not written: %+v", after)
+	}
+	if after.Until != before.Until || after.BreakerUntil != before.BreakerUntil || after.CoolKind != before.CoolKind {
+		t.Fatalf("query mutated scheduling state: before=%+v after=%+v", before, after)
+	}
+	if p.Pick() != nil {
+		t.Fatal("account must stay cooling after passive query")
+	}
+}
+
+// 签到标记按天：跨天后自动失效。
+func TestCheckinDoneResetsAcrossDays(t *testing.T) {
+	p := newTestPool(t)
+	addAcct(p, "u1", 100)
+	p.NoteCheckinDone("u1")
+	if !p.CheckinDoneToday("u1") {
+		t.Fatal("should be checked in today")
+	}
+	st, _ := p.Status("u1")
+	if !st.CheckinDone {
+		t.Fatalf("status should report checked in: %+v", st)
+	}
+
+	// 模拟「昨天签到」：直接把日期改成昨天。
+	p.mu.Lock()
+	p.byUID["u1"].checkinDone = nowFunc().AddDate(0, 0, -1).Format(checkinDateLayout)
+	p.mu.Unlock()
+	if p.CheckinDoneToday("u1") {
+		t.Fatal("yesterday's checkin must not count as today")
+	}
+	st, _ = p.Status("u1")
+	if st.CheckinDone {
+		t.Fatalf("status should report not-checked-in: %+v", st)
+	}
+}
+
+// 软冷却不应把 plan 长冷却错标成 soft_rate。
+func TestSoftCooldownDoesNotRelabelPlanCooldown(t *testing.T) {
+	p := newTestPool(t)
+	p.SetLimits(Limits{SoftRateBase: time.Second, SoftRateMax: time.Minute})
+	addAcct(p, "u1", 100)
+	p.Cooldown("u1", CoolPlan, 12*time.Hour, "plan")
+	p.CooldownSoftRate("u1", time.Second, time.Time{}, "429")
+	st, _ := p.Status("u1")
+	if st.CoolKind != CoolPlan.String() {
+		t.Fatalf("plan cooldown relabeled as %q", st.CoolKind)
+	}
+	// 正确标注后，额度回血应当能解掉它。
+	if !p.ReenableIfCredits("u1", 500) {
+		t.Fatal("credits back should clear plan cooldown")
 	}
 }

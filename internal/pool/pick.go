@@ -66,19 +66,12 @@ func (p *Pool) snapshotCandidates(scratch *pickScratch, tried map[string]bool, r
 	defer p.mu.RUnlock()
 
 	out := scratch.cands[:0]
-	maxInFlight := int(p.maxInFlight.Load())
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !e.healthyForModel(now, reqModel) {
-			continue
-		}
-		if maxInFlight > 0 && int(e.inFlight.Load()) >= maxInFlight {
-			continue
-		}
-		// 余额保底（0 = 关闭）：低于下限的号不再接新流量。
-		if floor := p.limits.CreditFloor; floor > 0 && e.credits < floor {
+		// 与 HasRotatable/粘性/模型可用性共用同一口径（见 routableLocked）。
+		if !p.routableLocked(e, now, reqModel) {
 			continue
 		}
 		out = append(out, pickCandidate{
@@ -102,16 +95,46 @@ func (p *Pool) commitPick(uid, reqModel string) *auth.Auth {
 		return nil
 	}
 	now := nowFunc()
-	if !e.healthyForModel(now, reqModel) {
-		return nil
-	}
-	if int(p.maxInFlight.Load()) > 0 && int(e.inFlight.Load()) >= int(p.maxInFlight.Load()) {
+	if !p.routableLocked(e, now, reqModel) {
 		return nil
 	}
 	p.mutSeq++
 	e.usedSeq = p.mutSeq
 	e.lastUsed = now
+	// lastUsed 参与持久化（重启后闲置补偿才不失真），因此要标记 dirty。
+	p.dirtySeq.Store(p.mutSeq)
 	return e.a
+}
+
+// ---------------------------------------------------------------------------
+// 统一的可用性判定
+// ---------------------------------------------------------------------------
+//
+// 为什么要抽出来：选号、粘性命中、可轮换探测、「该模型是否全池不可用」四处
+// 判定的口径必须完全一致。历史上这四处各写一份，结果是 ModelBlocked 没排
+// paused/余额地板、HasRotatable/PickByUIDForModel 没看 CreditFloor——面板说
+// 「有可用账号」而实际选不出号，或反过来误报「所有账号都对该模型冷却」。
+
+// floorBlocked 余额低于保底（CreditFloor<=0 = 关闭该规则）。
+func (p *Pool) floorBlocked(e *entry) bool {
+	floor := p.limits.CreditFloor
+	return floor > 0 && e.credits < floor
+}
+
+// baseUsableLocked 账号本身是否具备接流量的资格（不含模型级冷却、不含在途）。
+// paused/disabled/开关关闭/账号级冷却/熔断/余额地板 全部排除。
+func (p *Pool) baseUsableLocked(e *entry, now time.Time) bool {
+	return e.healthy(now) && !p.floorBlocked(e)
+}
+
+// availableLocked 账号在该模型上可用（静态口径，不看在途）。
+func (p *Pool) availableLocked(e *entry, now time.Time, model string) bool {
+	return p.baseUsableLocked(e, now) && !e.modelCooled(now, model)
+}
+
+// routableLocked 账号此刻能否真的接一个请求：可用 + 在途未满。
+func (p *Pool) routableLocked(e *entry, now time.Time, model string) bool {
+	return p.availableLocked(e, now, model) && !p.inFlightFull(e)
 }
 
 // chooseWeighted 对候选算权重，按权重降序取 TopK，再在 TopK 内加权随机。
@@ -235,20 +258,28 @@ func nanoOf(t time.Time) int64 {
 // ---------------------------------------------------------------------------
 
 // PickByUIDForModel 粘性命中路径：指定账号在该模型上当前可用则返回凭证，否则 nil。
-// 该路径不做权重挑选，也不提交 lastUsed（粘性路由不应扰动轮换次序）。
+//
+// 与 Pick 的区别：不参与权重挑选（会话粘性优先）。但**必须**同样提交
+// lastUsed/usedSeq —— 粘性请求同样是真实流量，账号确实被使用过。若不更新，
+// 「最久未使用」维度对长期跑粘性会话的号永远是旧值，闲置补偿会给它虚高的权重。
+//
+// 过滤口径与主路径完全一致（paused/disabled/余额地板/冷却/在途全排掉），
+// 否则会出现「粘性命中了一个主路径根本不会选的号」。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
 	if !ok {
 		return nil
 	}
-	if !e.healthyForModel(nowFunc(), model) {
+	now := nowFunc()
+	if !p.routableLocked(e, now, model) {
 		return nil
 	}
-	if p.inFlightFull(e) {
-		return nil
-	}
+	p.mutSeq++
+	e.usedSeq = p.mutSeq
+	e.lastUsed = now
+	p.dirtySeq.Store(p.mutSeq)
 	return e.a
 }
 
@@ -261,10 +292,7 @@ func (p *Pool) HasRotatable(tried map[string]bool, reqModel string) bool {
 		if tried != nil && tried[uid] {
 			continue
 		}
-		if !e.healthyForModel(now, reqModel) {
-			continue
-		}
-		if p.inFlightFull(e) {
+		if !p.routableLocked(e, now, reqModel) {
 			continue
 		}
 		return true
@@ -280,13 +308,8 @@ func (p *Pool) AvailableForModel(model string) []string {
 	now := nowFunc()
 	p.mu.RLock()
 	out := make([]string, 0, len(p.byUID))
-	floor := p.limits.CreditFloor
 	for uid, e := range p.byUID {
-		if !e.healthyForModel(now, model) {
-			continue
-		}
-		// 与选号口径一致：余额低于保底的号不算「可用」。
-		if floor > 0 && e.credits < floor {
+		if !p.availableLocked(e, now, model) {
 			continue
 		}
 		out = append(out, uid)
@@ -304,14 +327,7 @@ func (p *Pool) UIDAvailableForModel(uid, model string) bool {
 	if !ok {
 		return false
 	}
-	if !e.healthyForModel(nowFunc(), model) {
-		return false
-	}
-	// 与选号口径一致：低于余额保底的号不可路由（粘性路径也必须遵守）。
-	if floor := p.limits.CreditFloor; floor > 0 && e.credits < floor {
-		return false
-	}
-	return true
+	return p.availableLocked(e, nowFunc(), model)
 }
 
 // ModelBlocked 聚合查询：该模型是否在全池范围内都被冷却（无任何账号可用）。
@@ -323,10 +339,13 @@ func (p *Pool) ModelBlocked(model string) ModelBlockStatus {
 	if model == "" || len(p.byUID) == 0 {
 		return ModelBlockStatus{Model: model}
 	}
+	// 分母只算「本来就能接流量的账号」：paused/禁用/余额地板/账号级冷却中的号
+	// 对任何模型都不可用，把它们算进分母会让「其他号正在冷却」掩盖成
+	// 「该模型在全池被封锁」的误报（反之也会把真封锁算成没封锁）。
 	var total, cooled int
 	var until time.Time
 	for _, e := range p.byUID {
-		if e.disabled || !e.enabled {
+		if !p.baseUsableLocked(e, now) {
 			continue
 		}
 		total++

@@ -25,7 +25,10 @@ package upstream
 
 import (
 	"bufio"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -172,7 +175,16 @@ func scanLine(st *sseState, line string) *SOLOEvent {
 
 // Aggregate 读取完整 SOLO SSE，聚合 response + reasoning + tool_calls + usage，
 // 产出单个 OpenAI chat.completion（非流式）。
+//
+// 保持旧签名（不动既有调用方）；需要回填 model 的调用方用 AggregateWithModel。
 func Aggregate(r io.Reader) (map[string]any, error) {
+	return AggregateWithModel(r, "")
+}
+
+// AggregateWithModel 同 Aggregate，额外把响应里的 model 字段回填成客户端请求的
+// 模型名。上游 metadata 的 model 常为空，留空会让 OpenAI 客户端按模型统计/路由
+// 失效（部分 SDK 在 model 为空时直接报协议错误）。
+func AggregateWithModel(r io.Reader, model string) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var (
 		id           string
@@ -184,6 +196,10 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		toolCalls    = map[int]map[string]any{}
 		toolOrder    []int
 		upstreamErr  error
+		// sawOutput 记录是否至少收到一帧有效内容；sawDone 记录上游是否正常收尾。
+		// 两者共同决定「空流」与「截断流」——这两种以前都会被当成成功响应。
+		sawOutput bool
+		sawDone   bool
 	)
 	st := &sseState{}
 	for {
@@ -202,12 +218,17 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 				}
 			case "output", "plan_item":
 				// 与非流式一致：上游可能发增量也可能发累计快照，由 textAcc 统一判定。
+				if ev.Response != "" || ev.Reasoning != "" ||
+					(len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null") {
+					sawOutput = true
+				}
 				content.add(ev.Response)
 				reasoning.add(ev.Reasoning)
 				mergeToolCallJSON(toolCalls, &toolOrder, ev.ToolCalls)
 			case "token_usage":
 				usage = ev.Usage
 			case "done":
+				sawDone = true
 				if ev.FinishReason != "" {
 					finishReason = ev.FinishReason
 				}
@@ -222,8 +243,22 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 	if upstreamErr != nil {
 		return nil, upstreamErr
 	}
+	// 空流：上游收下请求、既没报错也没给任何内容（常见于账号被静默风控、
+	// 或请求被上游直接吞掉）。以前这里会返回 content:"" + finish_reason:"stop"，
+	// 客户端以为模型真的回答了空字符串，既无法重试也不会报错。
+	if !sawOutput {
+		return nil, ErrEmptyCompletion
+	}
+	// 截断流：有内容但没有 done 收尾（连接被中途掐断）。仍返回内容会让调用方
+	// 把「半句话」当成正常结果落库/计费，所以显式报错，由上层换号重试。
+	if !sawDone {
+		return nil, fmt.Errorf("%w: content but no done event", ErrTruncatedStream)
+	}
 	if id == "" {
-		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+		id = newCompletionID()
+	}
+	if model = strings.TrimSpace(model); model == "" {
+		model = modelName // 客户端没给就回落到上游回报的名字
 	}
 	message := map[string]any{
 		"role":    "assistant",
@@ -244,7 +279,7 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 		"id":      id,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
-		"model":   modelName,
+		"model":   model,
 		"choices": []any{
 			map[string]any{
 				"index":         0,
@@ -358,6 +393,14 @@ type StreamOptions struct {
 	//   ThinkingContent         → 包进 think 标签作为 delta.content
 	//   ThinkingNone            → 丢弃
 	Thinking ThinkingMode
+	// SuppressErrorFrame 让 Run 在失败时只返回错误、不自行向客户端写
+	// error 帧与 [DONE]。
+	//
+	// 为什么需要：上游「空流 / 截断 / event:error」在**还没下发任何正文**时
+	// 是可以换号重试的；如果 Run 抢先写了 error 帧，客户端已经看到错误并结束
+	// 解析，后续重试的正文就成了孤儿帧。调用方（chat 主路径）据此先决定
+	// 「换号」还是「收尾报错」，再由它自己调用 WriteError。
+	SuppressErrorFrame bool
 	// IncludeUsage 对应 OpenAI 的 stream_options.include_usage。
 	//
 	// OpenAI 规范：只有客户端显式要求时，才在 [DONE] 之前追加一个
@@ -457,6 +500,7 @@ type streamTiming struct {
 	firstText  time.Time // 第一次真正向客户端下发正文/思考的时刻
 	maxGap     time.Duration
 	frames     int
+	toolFrames int // 下发过工具调用帧的次数
 	contentCh  int // 下发的正文字符数
 	thinkCh    int // 下发的思考字符数
 }
@@ -468,9 +512,18 @@ type StreamStats struct {
 	GenMs        int64 `json:"gen_ms"`         // 首帧→末帧
 	MaxGapMs     int64 `json:"max_gap_ms"`     // 最大帧间隔
 	Frames       int   `json:"frames"`
+	ToolFrames   int   `json:"tool_frames"`
 	ContentChars int   `json:"content_chars"`
 	ThinkChars   int   `json:"think_chars"`
 	HasTiming    bool  `json:"has_timing"`
+}
+
+// HasOutput 报告这条流是否真正给客户端下发过内容（正文/思考/工具调用）。
+//
+// 只发过 role 帧和心跳注释的空流必须判为失败：否则「账号被静默风控」会被
+// 记成一次成功，既污染成功率统计，也让会话粘性钉死在坏号上。
+func (st StreamStats) HasOutput() bool {
+	return st.ContentChars > 0 || st.ThinkChars > 0 || st.ToolFrames > 0
 }
 
 // Stats 返回本次流的计时快照。必须在 Run 返回之后调用。
@@ -490,6 +543,7 @@ func (t *streamTiming) snapshot() StreamStats {
 	}
 	st := StreamStats{
 		Frames:       t.frames,
+		ToolFrames:   t.toolFrames,
 		ContentChars: t.contentCh,
 		ThinkChars:   t.thinkCh,
 		MaxGapMs:     t.maxGap.Milliseconds(),
@@ -518,6 +572,9 @@ func (t *streamTiming) noteFrame(now time.Time) {
 	t.lastFrame = now
 	t.frames++
 }
+
+// noteToolFrame 记录一次真正下发给客户端的工具调用帧（持锁）。
+func (t *streamTiming) noteToolFrame() { t.toolFrames++ }
 
 // noteText 记录一次真正下发到客户端的正文/思考（持锁）。
 func (t *streamTiming) noteText(now time.Time, contentChars, thinkChars int) {
@@ -550,7 +607,7 @@ func NewSSEWriter(w http.ResponseWriter, model string) *SSEWriter {
 	s := &SSEWriter{
 		w:        w,
 		fl:       asFlusher(w),
-		id:       fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
+		id:       newCompletionID(),
 		created:  now.Unix(),
 		model:    model,
 		thinking: ThinkingReasoning,
@@ -716,6 +773,11 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 	br := bufio.NewReaderSize(r, 64*1024)
 	var pendingUsage map[string]any
 	sawDone := false
+	// sawOutput 标记是否下发过任何正文/思考/工具调用。整条流一帧内容都没有，
+	// 说明上游静默吞了请求（风控/内部失败），必须报错让上层换号，
+	// 而不是补一个 [DONE] 让客户端以为「模型回答了空字符串」。
+	sawOutput := false
+	var streamErr *SOLOStreamError
 	st := &sseState{}
 
 	type readResult struct {
@@ -748,6 +810,11 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 		}
 		line, err := rr.line, rr.err
 		if err != nil && err != io.EOF {
+			// 空闲超时是上游静默（不是账号问题也不是客户端取消），
+			// 原样透出哨兵，chat 侧据 IsUpstreamTimeout 决定「不罚号、换号」。
+			if errors.Is(err, ErrStreamIdleTimeout) {
+				return ErrStreamIdleTimeout
+			}
 			return err
 		}
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
@@ -757,6 +824,10 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 				s.tm.noteFrame(time.Now())
 				out := s.contentSeen.add(ev.Response)
 				think := s.reasoningSeen.add(ev.Reasoning)
+				if out != "" || think != "" ||
+					(len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null") {
+					sawOutput = true
+				}
 				// 下发字符数按「实际写给客户端的量」计，而不是上游帧里的原始量：
 				// ThinkingNone 丢弃思考时不能把思考算进吞吐，否则 TPS 会被虚高。
 				// 字符数按 rune 计：中文一个汉字是 3 字节，用 len() 会把吞吐放大 3 倍。
@@ -816,6 +887,9 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 				if len(ev.ToolCalls) > 0 && string(ev.ToolCalls) != "null" {
 					if tc, ok := normalizeStreamToolCalls(ev.ToolCalls); ok {
 						s.WriteChunk(map[string]any{"tool_calls": tc}, "")
+						s.mu.Lock()
+						s.tm.noteToolFrame()
+						s.mu.Unlock()
 					}
 				}
 			case "token_usage":
@@ -865,10 +939,13 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 				sawDone = true
 			case "error":
 				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
+				streamErr = se
 				if opts.OnError != nil {
 					opts.OnError(se)
 				}
-				s.WriteError(fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage))
+				if !opts.SuppressErrorFrame {
+					s.WriteError(fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage))
+				}
 				sawDone = true
 			}
 		}
@@ -876,11 +953,26 @@ func (s *SSEWriter) Run(r io.Reader, opts StreamOptions) error {
 			break
 		}
 	}
-	if !sawDone {
-		// 幂等兜底：上游中断（无 done）仍写 [DONE]，避免客户端一直等。
+	// 上游没有正常收尾（没有 done、也没有 error）：先补 [DONE] 让客户端结束，
+	// 再把错误返回给调用方 —— 内容可能是半句话，不能当成功落库。
+	truncated := !sawDone
+	if truncated && !opts.SuppressErrorFrame {
 		s.mu.Lock()
 		s.writeRawLocked("data: [DONE]\n\n")
 		s.mu.Unlock()
+	}
+	switch {
+	case streamErr != nil:
+		// 是否已给客户端发过 error 帧取决于 SuppressErrorFrame：调用方据此
+		// 决定是「换号重试」还是「收尾报错」。
+		return streamErr
+	case !sawOutput:
+		if !opts.SuppressErrorFrame {
+			s.WriteError("upstream returned empty completion")
+		}
+		return ErrEmptyCompletion
+	case truncated:
+		return ErrTruncatedStream
 	}
 	return nil
 }
@@ -909,6 +1001,20 @@ func StreamWithOptions(w http.ResponseWriter, r io.Reader, opts StreamOptions) e
 	s.StartHeartbeat(opts.Heartbeat)
 	defer s.Close()
 	return s.Run(r, opts)
+}
+
+// newCompletionID 生成 OpenAI 风格 completion id。
+//
+// 为什么不用 UnixNano：纳秒时间戳在同一进程内可预测，多实例部署时还会撞号；
+// 而 id 会被客户端当作幂等键/日志关联键。用 16 字节随机数取 hex，碰撞概率可以
+// 忽略，也不泄露服务器时钟。
+func newCompletionID() string {
+	var b [12]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		// 随机源不可用极罕见；退化成时间戳也比返回空 id 好（客户端会校验非空）。
+		return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	return "chatcmpl-" + hex.EncodeToString(b[:])
 }
 
 // textAcc 累积上游文本并回答「这次该增量下发什么」。

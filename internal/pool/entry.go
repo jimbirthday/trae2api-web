@@ -78,12 +78,16 @@ type ModelBlockStatus struct {
 }
 
 // Counts 池内账号分类计数。
+//
+// BelowFloor 单列出来：余额低于 CreditFloor 的号「没坏也没被关」，只是暂时不接
+// 流量。把它算进 Healthy 会让面板显示「10 个健康」而实际一个都选不中。
 type Counts struct {
-	Total    int `json:"total"`
-	Healthy  int `json:"healthy"`
-	Cooling  int `json:"cooling"`
-	Disabled int `json:"disabled"`
-	Paused   int `json:"paused"`
+	Total      int `json:"total"`
+	Healthy    int `json:"healthy"`
+	Cooling    int `json:"cooling"`
+	Disabled   int `json:"disabled"`
+	Paused     int `json:"paused"`
+	BelowFloor int `json:"below_floor,omitempty"`
 }
 
 // Status 单个账号对外暴露的状态（脱敏，不含 token）。
@@ -160,6 +164,10 @@ type entry struct {
 	until    time.Time
 	reason   string
 	coolKind string
+	// reasonIsManual 标记 reason 是「用户手动关闭」写下的，而不是冷却/熔断写的。
+	// 只有这种 reason 才允许在重新启用时被清掉——冷却原因必须如实保留，
+	// 否则面板会显示「已启用、无原因」，实际却选不中。
+	reasonIsManual bool
 
 	softStreak int
 
@@ -179,8 +187,12 @@ type entry struct {
 
 	modelCooldowns map[string]modelCool
 
-	tokenUsage  TokenUsage
-	checkinDone bool
+	tokenUsage TokenUsage
+	// checkinDone 签到完成日期（本地时区 "2006-01-02"），空 = 未签到/未知。
+	//
+	// 为什么存日期而不是 bool：签到是「每天一次」的任务，存 bool 会让面板和调度器
+	// 永远认为「已签到」，跨天后再也不会自动签到（旧实现的实际缺陷）。
+	checkinDone string
 
 	// 选号热路径状态：lastUsed 用于闲置补偿，usedSeq 记录最近使用序号。
 	lastUsed time.Time
@@ -191,6 +203,56 @@ type entry struct {
 
 func newEntry(a *auth.Auth) *entry {
 	return &entry{a: a, enabled: true, modelCooldowns: map[string]modelCool{}}
+}
+
+// creditCool 报告当前账号级冷却是否属于「余额/额度耗尽型」。
+//
+// 只有这类冷却与「余额」有因果关系，回血后解除它是正确的；429 限流、5xx 熔断、
+// 连续错误都与余额无关，一旦被额度查询顺手清掉，等于每次查余额就免费给上游提速，
+// 上游会更快把号打死。
+func (e *entry) creditCool() bool {
+	return e.coolKind == CoolPlan.String()
+}
+
+// clearCreditCooldownLocked 只解除额度型冷却；失败率信号（errCount/softStreak/
+// breaker*/degradeUntil/consecutiveFails）一律保留。调用方持 p.mu 写锁。
+func (e *entry) clearCreditCooldownLocked() bool {
+	if !e.creditCool() {
+		return false
+	}
+	e.until = time.Time{}
+	e.coolKind = ""
+	e.reason = ""
+	e.reasonIsManual = false
+	return true
+}
+
+// hasActiveAutoLock 报告账号此刻是否处于自动锁（冷却或熔断）期内。
+func (e *entry) hasActiveAutoLock(now time.Time) bool {
+	if now.Before(e.until) || now.Before(e.breakerUntil) {
+		return true
+	}
+	return false
+}
+
+// clearAutoLocksLocked 清掉全部「自动」锁：账号级冷却、熔断、软退避、连败降权、
+// 错误计数。仅用于人工复活与「换了一套凭证重新导入」——这两件事都意味着
+// 之前的失败历史不再代表当前账号的能力。
+//
+// 不碰 enabled / paused / disabled：那是开关与运维意图，不是失败信号。
+func (e *entry) clearAutoLocksLocked() {
+	e.until = time.Time{}
+	// 手动关闭的 reason 保留：复活/换凭证不该改写人的意图。
+	if !e.reasonIsManual {
+		e.reason = ""
+	}
+	e.coolKind = ""
+	e.softStreak = 0
+	e.errCount = 0
+	e.breakerFails = 0
+	e.breakerUntil = time.Time{}
+	e.consecutiveFails = 0
+	e.degradeUntil = time.Time{}
 }
 
 // healthy 账号级可用：未禁用、开关打开、未暂停、不在账号级冷却/熔断期内。
@@ -220,11 +282,6 @@ func (e *entry) modelCooled(now time.Time, model string) bool {
 		return false
 	}
 	return now.Before(c.Until)
-}
-
-// healthyForModel 账号级健康 + 该模型未冷却。
-func (e *entry) healthyForModel(now time.Time, model string) bool {
-	return e.healthy(now) && !e.modelCooled(now, model)
 }
 
 // pendingModelCools 返回未过期的模型级冷却（按模型名排序由调用方保证可读性）。

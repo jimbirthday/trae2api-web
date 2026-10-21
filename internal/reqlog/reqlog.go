@@ -40,12 +40,40 @@ const (
 )
 
 // Outcome 取值（面板与指标按此分类统计）。
+//
+// 这组常量是**唯一权威取值**：写入方一律用常量，面板筛选下拉也从 KnownOutcomes
+// 取值，避免出现 "upstream_error"/"http_error" 这种同义不同名的分裂——
+// 一旦分裂，按结果筛选就会漏记录。
 const (
-	OutcomeSuccess     = "success"
-	OutcomeHTTPError   = "http_error"
-	OutcomeStreamError = "stream_error"
-	OutcomeInterrupted = "interrupted"
+	OutcomeSuccess     = "success"      // 正常完成
+	OutcomeHTTPError   = "http_error"   // 上游 HTTP/协议错误（4xx/5xx/建连失败）
+	OutcomeStreamError = "stream_error" // 流内 event:error 或流中断
+	OutcomeInterrupted = "interrupted"  // 客户端断连 / 本端取消
+	// OutcomeClientError 请求本身不合法（400/413/422），不经上游。
+	OutcomeClientError = "client_error"
+	// OutcomeClientCanceled 旧名，等价于 OutcomeInterrupted，仅为读旧归档兼容保留。
+	OutcomeClientCanceled = "client_canceled"
 )
+
+// KnownOutcomes 返回面板可筛选的结果分类（不含历史别名）。
+func KnownOutcomes() []string {
+	return []string{OutcomeSuccess, OutcomeHTTPError, OutcomeStreamError, OutcomeInterrupted, OutcomeClientError}
+}
+
+// knownOutcomeSet 精确匹配用集合（含历史别名，便于旧归档命中）。
+var knownOutcomeSet = map[string]bool{
+	OutcomeSuccess: true, OutcomeHTTPError: true, OutcomeStreamError: true,
+	OutcomeInterrupted: true, OutcomeClientError: true, OutcomeClientCanceled: true,
+}
+
+// canonicalOutcome 把历史别名归一到当前常量。
+func canonicalOutcome(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case OutcomeClientCanceled:
+		return OutcomeInterrupted
+	}
+	return strings.ToLower(strings.TrimSpace(v))
+}
 
 // Config 归档配置。Enabled=false 时只保留内存缓冲与指标。
 type Config struct {
@@ -224,12 +252,12 @@ func (r *Recorder) Record(e Event) {
 	if e.RequestID == "" {
 		e.RequestID = NewRequestID()
 	}
-	switch e.Outcome {
-	case "success":
+	switch canonicalOutcome(e.Outcome) {
+	case OutcomeSuccess:
 		r.succeeded.Add(1)
-	case "client_error":
+	case OutcomeClientError:
 		r.clientErrs.Add(1)
-	case "canceled", "client_canceled":
+	case OutcomeInterrupted, "canceled":
 		r.canceled.Add(1)
 	default:
 		r.failed.Add(1)
@@ -553,8 +581,18 @@ func (f Filter) match(e Event) bool {
 	if f.Model != "" && !containsFold(e.Model, f.Model) {
 		return false
 	}
-	if f.Outcome != "" && !containsFold(e.Outcome, f.Outcome) {
-		return false
+	if f.Outcome != "" {
+		// 面板下拉传的是 KnownOutcomes 里的常量 → 精确匹配（避免 "error" 之类
+		// 子串把 http_error / stream_error / client_error 混在一起）；
+		// 手输的自由文本仍走子串匹配，兼容 "upstream" 这种模糊筛选。
+		want := canonicalOutcome(f.Outcome)
+		if knownOutcomeSet[want] {
+			if canonicalOutcome(e.Outcome) != want {
+				return false
+			}
+		} else if !containsFold(e.Outcome, f.Outcome) {
+			return false
+		}
 	}
 	if f.Path != "" && !containsFold(e.Path, f.Path) {
 		return false
@@ -627,7 +665,11 @@ type fileLines struct {
 func newArchive(cfg Config) *archive {
 	a := &archive{cfg: cfg, queue: make(chan Event, cfg.QueueSize), done: make(chan struct{}),
 		counts: make(map[string]fileLines)}
-	_ = os.MkdirAll(cfg.Dir, 0o755)
+	// MkdirAll 不会收紧已存在目录的权限，而升级前的目录是 0755。流水文件里
+	// 有 UID/模型/客户端 IP，属于运维敏感数据，这里显式补一次收紧（尽力而为，
+	// 目录属于别人/只读挂载时忽略错误）。
+	_ = os.MkdirAll(cfg.Dir, 0o700)
+	_ = os.Chmod(cfg.Dir, 0o700)
 	a.cleanup()
 	a.wg.Add(1)
 	go a.run()
@@ -709,10 +751,12 @@ func (a *archive) rotate(day string) error {
 	for {
 		name := fmt.Sprintf("requests-%s-%d.jsonl", a.curDay, a.curSeq)
 		p := filepath.Join(a.cfg.Dir, name)
-		fh, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		fh, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			return err
 		}
+		// 老版本建的文件是 0644，OpenFile 的 perm 只对新建生效，这里显式夹紧。
+		_ = fh.Chmod(0o600)
 		st, err := fh.Stat()
 		if err != nil {
 			fh.Close()

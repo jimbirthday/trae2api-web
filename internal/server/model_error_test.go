@@ -21,7 +21,7 @@ func TestStreamModelUnavailableDoesNotCoolAccount(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 1, ErrCooldown: time.Minute})
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"custom_model_placeholder","stream":true,"messages":[]}`))
+		strings.NewReader(`{"model":"custom_model_placeholder","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	h.ServeHTTP(httptest.NewRecorder(), req)
 
 	st, _ := p.Status("u0")

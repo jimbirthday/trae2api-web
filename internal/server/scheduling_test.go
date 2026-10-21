@@ -107,7 +107,7 @@ func TestChatUpstreamTimeoutDoesNotPenalize(t *testing.T) {
 	p, _ := newSchedPool(t, 1)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 503 {
@@ -141,7 +141,7 @@ func TestChat429UsesSoftCooldown(t *testing.T) {
 	p, _ := newSchedPool(t, 1)
 	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 1})
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 503 {
@@ -171,7 +171,7 @@ func TestChatModelErrorRuleScopedToModel(t *testing.T) {
 	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 1, ErrCooldown: time.Minute})
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -191,7 +191,7 @@ func TestChatModelErrorRuleScopedToModel(t *testing.T) {
 	}
 	// 全池对该模型都被锁时，错误码应明确指出是模型阻塞而非账号不可用。
 	req = httptest.NewRequest("POST", "/v1/chat/completions",
-		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if !strings.Contains(rec.Body.String(), "model_blocked") {
@@ -206,7 +206,7 @@ func TestChatNoModelRuleByDefault(t *testing.T) {
 	})
 	p, _ := newSchedPool(t, 1)
 	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 1})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	st, _ := p.Status("u0")
@@ -264,7 +264,7 @@ func TestChatRecordsRequestLog(t *testing.T) {
 	defer rl.Close()
 	h := NewHandler(Config{Pool: p, Upstream: up, RequestLog: rl})
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -345,7 +345,7 @@ func TestRequestsAPIIncludesRecentNotYetFlushed(t *testing.T) {
 	defer rl.Close()
 	h := NewHandler(Config{Pool: p, Upstream: up, RequestLog: rl})
 
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	h.ServeHTTP(httptest.NewRecorder(), req)
 
 	rec := httptest.NewRecorder()

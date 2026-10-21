@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"trae2api-web/internal/auth"
 	"trae2api-web/internal/pool"
@@ -93,7 +94,7 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		if a := h.cfg.Pool.AuthByUID(s.UID); a != nil {
 			sum.HasAuth = true
 			sum.ExpiresAt = a.ExpiresAt
-			if a.ExpiresAt > 0 && a.NeedsRefresh(24*60*60) { // 24h 内过期
+			if a.ExpiresAt > 0 && a.NeedsRefresh(24*time.Hour) { // 24h 内过期
 				sum.ExpiredSoon = true
 			}
 			sum.MachineID = prefix(a.MachineID, 8)
@@ -150,6 +151,12 @@ func accountStatusKey(s accountSummary) string {
 	}
 }
 
+// expectedImportFormats 导入失败时的提示文案：把支持的四种形态一次说清，
+// 用户不用猜「为什么我贴的文件不被识别」。
+const expectedImportFormats = "；支持：1) TRAE 回调链接字符串；" +
+	"2) {\"json\":\"<账号JSON>\"}；3) {\"accounts\":[...]} 或顶层 [ ... ] 批量导出" +
+	"（trae-cn-relay-accounts / 浏览器导出格式）；4) 单个账号对象"
+
 // importRequest 导入请求体。
 type importRequest struct {
 	// 三选一：
@@ -180,14 +187,23 @@ func (h *Handler) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req importRequest
-	// 先尝试 JSON 解析（{...}）；失败则当回调链接字符串
+	// 按首字符分发：`[...]` 是顶层数组导出（批量），`{...}` 是 JSON 对象，
+	// 其余当 TRAE 回调链接字符串。
+	// 历史实现只认 "{"，导致顶层数组导出会被误当成回调链接拼到上游。
 	trim := strings.TrimSpace(string(body))
-	if strings.HasPrefix(trim, "{") {
+	switch {
+	case strings.HasPrefix(trim, "[") || strings.HasPrefix(trim, "{"):
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "parse json: "+err.Error())
+			// 顶层数组无法解进 importRequest（结构不匹配），走批量通道。
+			if strings.HasPrefix(trim, "[") {
+				h.importRelayBatch(w, body)
+				return
+			}
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+				"parse json: "+err.Error()+expectedImportFormats)
 			return
 		}
-	} else {
+	default:
 		// 纯字符串 body → 当回调链接
 		req.CallbackURL = trim
 	}
@@ -211,7 +227,8 @@ func (h *Handler) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 	case req.JSON != "":
 		a, err = h.importFromJSON(req)
 	default:
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "need callback_url or json")
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
+			"need callback_url or json"+expectedImportFormats)
 		return
 	}
 	if err != nil {
@@ -219,7 +236,12 @@ func (h *Handler) adminImportAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.FilePath == "" {
-		a.FilePath = auth.FilePathFor(h.cfg.AuthDir, a.UID)
+		fp, ferr := auth.SafeFilePathFor(h.cfg.AuthDir, a.UID)
+		if ferr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", ferr.Error())
+			return
+		}
+		a.FilePath = fp
 	}
 
 	// 落盘（原子写，复用 auth.SaveAtomic）
@@ -318,18 +340,30 @@ func (h *Handler) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "missing uid")
 		return
 	}
-	fp := auth.FilePathFor(h.cfg.AuthDir, uid)
-	removed := h.cfg.Pool.Remove(uid)
-	if !removed {
-		// 池中无但有残留文件 → 也清掉文件（幂等）
-		if _, err := os.Stat(fp); err == nil {
-			_ = os.Remove(fp)
+	// UID 会拼进文件名，先校验防路径穿越（否则可删 authDir 外的任意 *.json）。
+	if err := auth.ValidateUID(uid); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", err.Error())
+		return
+	}
+	// 优先删该账号真实的落盘文件（可能来自导入目录而非 AuthDir 下的 trae-{uid}.json）。
+	var fp string
+	if a := h.cfg.Pool.AuthByUID(uid); a != nil {
+		fp = a.FilePath
+	}
+	if fp == "" {
+		if p, err := auth.SafeFilePathFor(h.cfg.AuthDir, uid); err == nil {
+			fp = p
 		}
+	}
+	removed := h.cfg.Pool.Remove(uid)
+	if fp != "" {
+		_ = os.Remove(fp) // 池条目已删，文件尽量删（不存在不报错）
+	}
+	if !removed {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "account not in pool")
 		return
 	}
-	_ = os.Remove(fp) // 池条目已删，文件尽量删（不存在不报错）
-	writeJSON(w, http.StatusOK, map[string]any{"uid": uid, "deleted": true})
+	writeJSON(w, http.StatusOK, map[string]any{"uid": uid, "deleted": true, "file": fp})
 }
 
 // patchRequest PATCH 体：开关 / nickname。
@@ -362,17 +396,18 @@ func (h *Handler) adminPatchAccount(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_ = st // nickname 更新需要改 auth 文件
-	if req.Nickname != nil && *req.Nickname != "" {
+	if req.Nickname != nil {
 		a := h.cfg.Pool.AuthByUID(uid)
 		if a == nil {
 			writeOpenAIError(w, http.StatusNotFound, "not_found", "no auth for uid")
 			return
 		}
-		a.Nickname = *req.Nickname
-		if a.FilePath == "" {
-			a.FilePath = auth.FilePathFor(h.cfg.AuthDir, uid)
+		// 允许空串（清空昵称）；落盘走 Auth 的写锁，绝不绕过锁直写字段，
+		// 否则与 token 刷新的 SaveAtomic 并发时会互相覆盖。
+		if err := a.SetNickname(*req.Nickname); err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "save_failed", err.Error())
+			return
 		}
-		_ = a.SaveAtomic()
 	}
 	st2, _ := h.cfg.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, st2)
@@ -395,7 +430,12 @@ func (h *Handler) adminRefreshAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if a.FilePath == "" {
-		a.FilePath = auth.FilePathFor(h.cfg.AuthDir, uid)
+		fp, ferr := auth.SafeFilePathFor(h.cfg.AuthDir, uid)
+		if ferr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", ferr.Error())
+			return
+		}
+		a.FilePath = fp
 	}
 	if err := a.SaveAtomic(); err != nil {
 		writeOpenAIError(w, http.StatusInternalServerError, "save_failed", err.Error())
@@ -475,25 +515,32 @@ func isSessionDeadErr(err error) bool {
 }
 
 // relayPayload 判断本次导入是否走批量通道，返回待解析的原始 JSON。
-// 判定顺序：{"json":...} 里的内容 → 整个 body。都不是中转格式则返回 nil（回落单条逻辑）。
+//
+// 判定顺序：{"json":...} 里的内容 → 整个 body。
+// 用结构化解析而非子串匹配：历史上用 bytes.Contains(`"auth"`) 判定，
+// 只要某个 token/昵称里出现 "accounts" 字样就会误判整包格式。
 func relayPayload(req importRequest, body []byte) []byte {
 	if req.CallbackURL != "" {
 		return nil // 回调链接优先，绝不按批量处理
 	}
-	cand := []byte(strings.TrimSpace(req.JSON))
+	cand := bytes.TrimSpace([]byte(req.JSON))
 	if len(cand) == 0 {
 		cand = bytes.TrimSpace(body)
 	}
 	if len(cand) == 0 || (cand[0] != '{' && cand[0] != '[') {
 		return nil
 	}
-	// 本仓库嵌套形含 "auth" 键，绝不误判
-	if bytes.Contains(cand, []byte(`"auth"`)) && !bytes.Contains(cand, []byte(`"accounts"`)) {
-		return nil
-	}
-	// 支持：整包 {"accounts":[..]}、顶层数组 [..]、多条格式 A/B 首尾相接的文件内容。
 	if !auth.HasAccounts(cand) {
 		return nil
+	}
+	// 本仓库嵌套形 {"auth":{...},"account":{...}} 交给单条通道（Parse 认识它）。
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(cand, &probe); err == nil {
+		if _, hasAuth := probe["auth"]; hasAuth {
+			if _, hasAccounts := probe["accounts"]; !hasAccounts {
+				return nil
+			}
+		}
 	}
 	return cand
 }
@@ -513,6 +560,11 @@ func (h *Handler) importRelayBatch(w http.ResponseWriter, raw []byte) {
 	results := make([]map[string]any, 0, len(list))
 	created, updated, failed := 0, 0, 0
 	seen := make(map[string]bool, len(list))
+	// 写前快照：判定 created/updated 用（避免 os.Stat → SaveAtomic 之间的 TOCTOU）。
+	existed := make(map[string]bool, len(list))
+	for _, st := range h.cfg.Pool.List() {
+		existed[st.UID] = true
+	}
 	for _, a := range list {
 		item := map[string]any{"uid": a.UID, "nickname": a.Nickname}
 		if a.UID == "" {
@@ -541,8 +593,14 @@ func (h *Handler) importRelayBatch(w http.ResponseWriter, raw []byte) {
 		}
 		seen[a.UID] = true
 
-		a.FilePath = auth.FilePathFor(h.cfg.AuthDir, a.UID)
-		_, statErr := os.Stat(a.FilePath)
+		fp, fpErr := auth.SafeFilePathFor(h.cfg.AuthDir, a.UID)
+		if fpErr != nil {
+			item["error"] = "invalid_uid: " + fpErr.Error()
+			results = append(results, item)
+			failed++
+			continue
+		}
+		a.FilePath = fp
 		if err := a.SaveAtomic(); err != nil {
 			item["error"] = "save_failed: " + err.Error()
 			results = append(results, item)
@@ -551,14 +609,15 @@ func (h *Handler) importRelayBatch(w http.ResponseWriter, raw []byte) {
 		}
 		h.cfg.Pool.Add(a)
 		if a.ImportDisabled {
-			// 导出文件里 enabled=false → 导入后保持停用（仍落盘，便于后续手动启用）。
+			// 导出文件里 enabled=false → 导入后置为停用（仍落盘，便于后续手动启用）。
 			h.cfg.Pool.SetEnabled(a.UID, false, "disabled in import file")
 			item["enabled"] = false
 		}
 		if n := a.CookieCount(); n > 0 {
 			item["cookies"] = n
 		}
-		if statErr == nil {
+		// created/updated 以「写前快照是否已在池中」判定，避免先 Stat 再写的 TOCTOU。
+		if existed[a.UID] {
 			item["action"] = "updated"
 			updated++
 		} else {

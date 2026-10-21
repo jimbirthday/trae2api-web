@@ -27,12 +27,14 @@
 
 ## 核心特性
 
-- **OpenAI 协议兼容**：提供标准 `/v1/chat/completions`（支持流式 Streaming 与非流式）与 `/v1/models` 端点，无缝接入 NextChat、Chatbox、Claude Code、Cline 等客户端。
+- **OpenAI 协议兼容**：提供标准 `/v1/chat/completions`（支持流式 Streaming 与非流式）、`/v1/models`、`/v1/models/{id}` 端点，
+  并对 `OPTIONS` 预检返回 CORS 头（默认 `*`，可用 `TW2A_CORS_ORIGINS` 收窄），无缝接入 NextChat、Chatbox、Claude Code、Cline 等客户端。
 - **可视化 Web 管理控制台**：内置轻量 Web 界面（`GET /admin`），实时展示账号配额（剩余/已用/总量）、签到状态与健康度，支持多账号并发查询与自动刷新。
 - **凭证全生命周期管理**：提供 Web 凭证导入、软启停开关、昵称修改、删除及一键 Web 登录闭环（无需手动抓包或提取 Token）。
 - **多账号智能调度池**：加权选号（余额 × 闲置补偿 × 手动权重 × 连败降权）、Top5 加权随机打散、单账号在途租约限流、账号级 + 模型级两级冷却、软限流指数退避、熔断与连败降权、会话粘性、超时/断连不误罚号。
 - **自动化运维与保活**：每日定时自动签到，并在 Token 过期前 24 小时自动预刷新与原子落盘，保障长周期稳定可用。
-- **新模型支持**：同步支持 glm-5.3、glm-5.2 等新版模型调度，适配最新协议版本。
+- **模型列表可扩展**：静态兜底表内置 32 个 SOLO `config_name`（`glm-5.2`、`kimi-k3`、`DeepSeek-V4-Pro` 等），
+  运行时还会向上游拉取动态模型列表并合并；`GET /v1/models` 与 `GET /v1/models/{id}` 都可查。
 - **丝滑的流式输出**：响应头 + `role` 帧在**毫秒级**下发（不等上游握手），段内逐帧 flush，跨 chunk 恒定 `id`/`created`/`model`；上游思考期由心跳 SSE 注释保活，思考内容可按 `stream.thinking` 选择走 `reasoning_content` 或包 `<think>` 标签当正文输出。
 - **纯净轻量**：纯 Go 标准库开发，零第三方运行时依赖，静态编译产物小巧，内存占用极低。
 
@@ -51,15 +53,49 @@ cp .env.example .env
 
 ```bash
 mkdir -p auths data
-docker compose up -d --build
+docker compose up -d --build      # 唯一构建入口，不依赖宿主预编译二进制
 ```
 
+> 多阶段构建（`golang:1.23-alpine` 编译 → `alpine:3.20` 运行）。
 > 镜像内含默认 `config.json`（端口 8000、目录 `/app/auths`、`/app/data`）；
 > 想用宿主的 `config.json` 覆盖，把 `docker-compose.yml` 里
 > `./config.json:/app/config.json:ro` 那行取消注释即可。
 > 换宿主端口：`TW2A_PORT=8080 docker compose up -d`（容器内恒为 8000）。
 
-3. **接口健康检查与模型验证**
+3. **TRAE 网页登录回调：两种部署方式（必须二选一，否则登录闭环不通）**
+
+| 方式 | 配置 | 说明 |
+|---|---|---|
+| **A. 公网反代（推荐）** | `TW2A_PUBLIC_BASE_URL=https://trae.example.com` | 回调链接 = `https://trae.example.com/authorize`，把该路径反代到容器 `8000`。**不需要**额外映射端口，也支持 HTTPS。 |
+| **B. 端口直连（本机调试）** | `TW2A_CALLBACK_PORT=18080` + `TW2A_CALLBACK_PUBLISH=18080` | compose 会把容器 `18080` 映射到宿主同端口，回调链接用「宿主机可达地址」拼出。仅适合本机或内网，不要暴露公网。 |
+
+要点：
+
+- 容器内回调 server **绑 `0.0.0.0`**（`TW2A_CALLBACK_BIND`，默认 `0.0.0.0`）。
+  以前绑 `127.0.0.1`，在容器里等于「只有容器自己可达」，从宿主/反代发起的回调必然超时。
+- 两条都不配也不会崩，只是登录会退化成「面板手动粘贴回调链接」。
+- 反代务必转发 `Host` 与 `X-Forwarded-Proto`，否则生成的跳转地址协议/域名会错。
+- 关闭回调 server：`TW2A_CALLBACK_PORT=0`（同时把 compose 里那条 `18080` 端口映射注释掉）。
+
+**启动自检与摘要。** 启动时会打印一行汇总，排障基本靠它：
+
+```
+startup summary: listen=:8000 accounts=5 api_key=true reqlog=true usage=true session=true
+  schedule=checkin 09:00 / refresh [3] / balance [8 12 18 23]
+  callback=https://trae.example.com/authorize public_base_url="https://trae.example.com"
+  auth_dir=./auths ignored_env=0 config_warnings=0
+```
+
+- `accounts=0` 时会额外打印「无可用账号，请先在面板导入」，不会静默空跑。
+- `ignored_env` / `config_warnings` 分别是被忽略的非法环境变量数与在归一化阶段
+  被夹紧/回落的配置项数，明细见上方 `[config]` 日志行。
+
+**优雅停机。** 收到 `SIGTERM` 后：① 停止接收新请求并用 15s 等在途（含流式）请求收尾；
+② 停调度器与会话 GC；③ `usage.Tracker` 最后一次 flush；④ 请求流水归档队列 flush；
+⑤ 账号池状态（冷却/额度）落盘。compose 里 `stop_grace_period: 25s` 保证这个过程
+不会被 docker 的默认 10s 提前 SIGKILL——否则停机瞬间可能丢 token 轮换和用量。
+
+4. **接口健康检查与模型验证**
 
 ```bash
 # 健康检查
@@ -215,7 +251,9 @@ TRAE 是无状态全量上下文，粘性不解决上下文拼接，但能避免
 ### 请求流水
 
 `reqlog` 记录每请求的 uid / 模型 / 状态 / 结果 / 延迟 / tokens / 换号次数，
-内存保留最近 512 条，可选按天归档到 `data/logs/requests-YYYYMMDD-N.jsonl`（默认 16MiB/文件、保留 3 天）。
+内存保留最近 512 条，可选按天归档到 `data/logs/requests-YYYYMMDD-N.jsonl`（默认 16MiB/文件、保留 3 天，
+清理由后台**每小时**跑一次，容器连续跑几天也不会把磁盘写满）。归档文件权限 `0600`、目录 `0700`——
+流水里有 uid / 模型 / 客户端 IP，属于敏感运维数据。
 面板「请求流水」页可按 uid / 模型 / 结果过滤并分页。**不记录提示词、响应正文与凭证。**
 
 归档读取走**文件尾部倒读**（按 64KiB 块从末尾往前扫，凑够一页就停），不再整文件解析；
@@ -275,6 +313,24 @@ N 个账号就是 2N 次上游调用。改前「切 tab 就全量重查」，5 �
 
 ## OpenAI 兼容性
 
+### 端点
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|---|---|---|---|
+| POST | `/v1/chat/completions` | Bearer | 对话补全，支持 `stream: true` |
+| GET | `/v1/models` | Bearer | 模型列表（静态兜底表 + 上游动态列表合并） |
+| GET | `/v1/models/{id}` | Bearer | 单个模型详情；不存在返回 OpenAI 风格 404 |
+| OPTIONS | `/v1/*` | — | CORS 预检，直接返回 204 |
+| GET | `/healthz` | — | 健康检查（容器 healthcheck 用） |
+| GET | `/status` | Bearer | 账号池运行状态 |
+| GET | `/admin` | 面板口令/cookie | Web 控制台 |
+
+CORS 默认 `Access-Control-Allow-Origin: *`（本服务用 Bearer 而非 cookie，不需要
+`Allow-Credentials`）。要收窄就在 `TW2A_CORS_ORIGINS` 里配逗号分隔的白名单，
+未命中的来源不会拿到 CORS 头。
+
+### 协议细节
+
 对外接口严格遵循 OpenAI Chat Completions 规范，三个容易被忽略的点：
 
 **思考内容不进 `content`。** 默认 `stream.thinking=reasoning`：`content` 只有正文，
@@ -307,35 +363,83 @@ OpenAI 原生行为，它只是为了照顾不识别 `reasoning_content` 的客�
 
 ## 配置项参考
 
-所有配置项均可通过环境变量或 `config.json` 进行调整：
+除 `upstream.model_error_rules`（模型级错误规则表，只能写 `config.json`）外，
+下面列出的每一项都可通过 `config.json` 或同名 `TW2A_*` 环境变量调整
+（**环境变量优先级更高**）。
+环境变量值非法时不会静默忽略：启动日志会打一条
+`[config] 忽略非法环境变量 XXX="..."（保持当前生效值 ...）`，并在启动摘要里给出
+`ignored_env=N` 计数；被夹紧/回落的配置项同样会打 `[config] ...` 并计入
+`config_warnings=N`。
+
+### 服务与网络
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `TW2A_API_KEY` | (必填) | 服务鉴权密钥，用于 API 调用与控制台写操作 |
-| `TW2A_LISTEN` | `:8000` | 主服务监听地址及端口 |
+| `TW2A_API_KEY` | (必填) | 服务鉴权密钥：API 调用 + 面板登录口令 |
+| `TW2A_LISTEN` | `:8000` | 主服务监听地址 |
 | `TW2A_PORT` | `8000` | （仅 docker compose）宿主暴露端口 |
-| `TW2A_AUTH_DIR` | `./auths` | 账号凭证存储目录 |
+| `TW2A_CALLBACK_PORT` | `18080` | TRAE 登录回调端口（`0` = 不起回调 server，走手动粘贴） |
+| `TW2A_CALLBACK_BIND` | `0.0.0.0` | 回调 server 绑定地址。容器/反代场景**不能**用 `127.0.0.1` |
+| `TW2A_CALLBACK_PUBLISH` | `18080` | （仅 docker compose）回调端口映射到宿主的端口 |
+| `TW2A_PUBLIC_BASE_URL` | (空) | 公网基址，如 `https://trae.example.com`。非空时回调链接为 `<该值>/authorize`，**Docker 生产部署推荐** |
+| `TW2A_CORS_ORIGINS` | (空 = `*`) | `/v1/*` 允许的跨域来源，逗号分隔 |
+
+### 存储与日志
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `TW2A_AUTH_DIR` | `./auths` | 账号凭证目录（`trae-<uid>.json`） |
 | `TW2A_STATE_FILE` | `./data/state.json` | 账号池状态持久化文件 |
-| `TW2A_DEFAULT_MODEL` | `glm-5.2` | 默认回退请求模型 |
-| `TW2A_CALLBACK_PORT` | `18080` | 本地 OAuth 回调端口（设为 0 可关闭） |
-| `TW2A_TIMEOUT_SECONDS` | `120` | 上游请求超时时长（秒） |
-| `TW2A_ERR_THRESHOLD` | `3` | 触发冷却前的连续错误次数 |
-| `TW2A_ERR_COOLDOWN` | `10m` | 熔断/错误冷却基数 |
-| `TW2A_SOFT_RATE_MAX` | `30m` | 软限流指数退避封顶 |
-| `TW2A_MAX_IN_FLIGHT` | `2` | 单账号最大在途请求数（0 = 不限） |
-| `TW2A_BREAKER_THRESHOLD` | `3` | 连续失败触发熔断的阈值 |
-| `TW2A_BREAKER_COOLDOWN` | `10m` | 熔断基数（连续触发翻倍） |
-| `TW2A_CREDIT_FLOOR` | `0` | 余额保底：`credits` 低于该值的号不参与选号/粘性路由（0 = 关闭） |
-| `TW2A_SESSION_ENABLED` | `true` | 是否启用会话粘性 |
-| `TW2A_SESSION_TTL` | `30m` | 会话绑定 TTL |
-| `TW2A_REQLOG_ENABLED` | `true` | 是否记录请求流水 |
-| `TW2A_REQLOG_DIR` | `./data/logs` | 请求流水归档目录 |
-| `TW2A_REQLOG_RETAIN_DAYS` | `3` | 归档保留天数（含当天，小时级自动清理） |
-| `TW2A_STREAM_THINKING` | `reasoning` | 思考内容呈现：`reasoning`（走 `reasoning_content`，正文干净，推荐）/ `content`（包 `<think>` 标签当正文，空档期立刻有字）/ `none`（丢弃） |
-| `TW2A_STREAM_HEARTBEAT` | `1s` | 空闲保活间隔（上游静默时写 SSE 注释，防代理掐断）；`0`/`off` 关闭 |
-| `TW2A_USAGE_ENABLED` | `true` | 是否统计按模型用量（token/缓存/积分采样） |
+| `TW2A_USAGE_ENABLED` | `true` | 是否统计按模型用量（token/缓存/积分采样/TPS） |
 | `TW2A_USAGE_FILE` | `./data/usage.json` | 用量统计持久化文件 |
 | `TW2A_CREDIT_SAMPLING` | `30s` | 积分采样窗口（`0` = 关闭积分采样） |
+| `TW2A_REQLOG_ENABLED` | `true` | 是否记录请求流水 |
+| `TW2A_REQLOG_DIR` | `./data/logs` | 请求流水归档目录（文件权限 `0600`，目录 `0700`） |
+| `TW2A_REQLOG_FILE_MAX_MB` | `16` | 单个归档文件上限（MiB），超过即滚动新文件 |
+| `TW2A_REQLOG_RETAIN_DAYS` | `3` | 归档保留天数（含当天；**每小时**自动清理，容器长跑不会涨） |
+
+### 上游与超时
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `TW2A_DEFAULT_MODEL` | `glm-5.2` | 默认回退模型 |
+| `TW2A_TIMEOUT_SECONDS` | `120` | 上游请求超时（秒，上限 3600） |
+
+### 冷却 / 熔断 / 降权
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `TW2A_PLAN_CREDIT` | `12h` | 权益包不足（`1005`）长冷却时长 |
+| `TW2A_SOFT_RATE` | `60s` | HTTP 429 软限流基数（指数退避的起点） |
+| `TW2A_SOFT_RATE_MAX` | `30m` | 软限流指数退避封顶 |
+| `TW2A_ERR_THRESHOLD` | `3` | 连续错误次数阈值（旧键，同时设置熔断阈值） |
+| `TW2A_ERR_COOLDOWN` | `10m` | 错误冷却基数 |
+| `TW2A_BREAKER_THRESHOLD` | `3` | 连续失败触发熔断的阈值（1..64） |
+| `TW2A_BREAKER_COOLDOWN` | `10m` | 熔断冷却基数（连续触发翻倍） |
+| `TW2A_BREAKER_COOLDOWN_MAX` | `1h` | 熔断冷却封顶（不得小于基数） |
+| `TW2A_DEGRADE_THRESHOLD` | `5` | 连败降权阈值（1..64） |
+| `TW2A_DEGRADE_WINDOW` | `10m` | 降权持续时间 |
+| `TW2A_MAX_IN_FLIGHT` | `2` | 单账号最大在途请求数（`0` = 不限，上限 64） |
+| `TW2A_CREDIT_FLOOR` | `0` | 余额保底：`credits` 低于该值的号不参与选号/粘性路由（`0` = 关闭） |
+
+### 会话粘性与定时任务
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `TW2A_SESSION_ENABLED` | `true` | 是否启用会话粘性 |
+| `TW2A_SESSION_TTL` | `30m` | 会话绑定 TTL |
+| `TW2A_SESSION_GC_INTERVAL` | `5m` | 过期绑定清理间隔 |
+| `TW2A_CHECKIN_HOUR` | `9` | 每日自动签到的整点（0..23） |
+| `TW2A_SCHEDULE_REFRESH_HOURS` | `3` | token 预刷新整点列表，逗号分隔（元素 0..23） |
+| `TW2A_SCHEDULE_BALANCE_HOURS` | `8,12,18,23` | 余额回写整点列表，逗号分隔（元素 0..23） |
+| `TW2A_SCHEDULE_CONCURRENCY` | `4` | 定时任务对上游的并发上限（1..32）。串行在账号多时跑不完且无法及时响应 SIGTERM |
+
+### 输出与思考
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `TW2A_STREAM_THINKING` | `reasoning` | 思考内容呈现：`reasoning`（走 `reasoning_content`，正文干净）/ `content`（包 `<think>` 当正文，空档期立刻有字）/ `none`（丢弃） |
+| `TW2A_STREAM_HEARTBEAT` | `1s` | 空闲保活间隔（上游静默时写 SSE 注释，防代理掐断）；`0`/`off` 关闭 |
 
 ### 用量统计
 

@@ -1,6 +1,9 @@
 {
   "listen": ":8000",
   "callback_port": "18080",
+  "callback_bind": "0.0.0.0",
+  "public_base_url": "",
+  "cors_origins": [],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "default_model": "glm-5.2",
@@ -50,7 +53,8 @@
       12,
       18,
       23
-    ]
+    ],
+    "concurrency": 4
   },
   "upstream": {
     "timeout_seconds": 120,

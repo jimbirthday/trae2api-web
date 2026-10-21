@@ -5,6 +5,7 @@ package auth
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -150,6 +151,15 @@ func (a *Auth) SetProfile(weight *int, note *string) error {
 	return a.saveAtomicLocked()
 }
 
+// SetNickname 在持锁状态下更新昵称并落盘；允许空串（用于清空昵称）。
+// 落盘错误会原样返回，绝不吞掉（否则内存与磁盘会静默分叉）。
+func (a *Auth) SetNickname(nick string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Nickname = strings.TrimSpace(nick)
+	return a.saveAtomicLocked()
+}
+
 // NormalizeWeight 把任意权重收敛到 [1,100]；0/负数/异常值回落 1（不干预）。
 func NormalizeWeight(w int) int {
 	if w < 1 {
@@ -197,10 +207,12 @@ func (a *Auth) NeedsRefresh(within time.Duration) bool {
 
 // NeedsRefreshLocked 是 NeedsRefresh 的持锁内部版本；调用方必须已持有 a.mu（读或写锁）。
 func (a *Auth) NeedsRefreshLocked(within time.Duration) bool {
-	if a.ExpiresAt <= 0 {
-		return true
+	if a.ExpiresAt > 0 {
+		return time.Now().Add(within).Unix() >= a.ExpiresAt
 	}
-	return time.Now().Add(within).Unix() >= a.ExpiresAt
+	// 过期时刻未知：只有拿到 refreshToken 才值得硬刷新；access-token-only 账号
+	// 换不出新 token，硬刷新会被上游以 no refreshToken 拒绝并把号打成冷却。
+	return strings.TrimSpace(a.RefreshToken) != ""
 }
 
 // parseNested 兼容现有 trae-*.json 嵌套形：
@@ -209,14 +221,14 @@ func (a *Auth) NeedsRefreshLocked(within time.Duration) bool {
 func parseNested(raw []byte) (*Auth, error) {
 	var n struct {
 		Auth struct {
-			AccessToken  string   `json:"accessToken"`
-			RefreshToken string   `json:"refreshToken"`
-			ExpiresAt    int64    `json:"expiresAt"`
-			Domain       string   `json:"domain"`
-			ApiHost      string   `json:"apiHost"`
-			MachineID    string   `json:"machineId"`
-			DeviceID     string   `json:"deviceId"`
-			Cookies      []Cookie `json:"cookies"`
+			AccessToken  string          `json:"accessToken"`
+			RefreshToken string          `json:"refreshToken"`
+			ExpiresAt    json.RawMessage `json:"expiresAt"`
+			Domain       string          `json:"domain"`
+			ApiHost      string          `json:"apiHost"`
+			MachineID    string          `json:"machineId"`
+			DeviceID     string          `json:"deviceId"`
+			Cookies      []Cookie        `json:"cookies"`
 		} `json:"auth"`
 		Account struct {
 			UID          string `json:"uid"`
@@ -232,7 +244,7 @@ func parseNested(raw []byte) (*Auth, error) {
 	return &Auth{
 		AccessToken:  n.Auth.AccessToken,
 		RefreshToken: n.Auth.RefreshToken,
-		ExpiresAt:    n.Auth.ExpiresAt,
+		ExpiresAt:    parseExpiresAtRaw(n.Auth.ExpiresAt),
 		Domain:       n.Auth.Domain,
 		ApiHost:      n.Auth.ApiHost,
 		MachineID:    n.Auth.MachineID,
@@ -251,19 +263,19 @@ func parseNested(raw []byte) (*Auth, error) {
 //	{"accessToken":...,"uid":...,"machineId":...,"deviceId":...}
 func parseFlat(raw []byte) (*Auth, error) {
 	var f struct {
-		AccessToken  string   `json:"accessToken"`
-		RefreshToken string   `json:"refreshToken"`
-		ExpiresAt    int64    `json:"expiresAt"`
-		Domain       string   `json:"domain"`
-		ApiHost      string   `json:"apiHost"`
-		MachineID    string   `json:"machineId"`
-		DeviceID     string   `json:"deviceId"`
-		Cookies      []Cookie `json:"cookies"`
-		UID          string   `json:"uid"`
-		EnterpriseID string   `json:"enterpriseId"`
-		Nickname     string   `json:"nickname"`
-		Weight       int      `json:"weight"`
-		Note         string   `json:"note"`
+		AccessToken  string          `json:"accessToken"`
+		RefreshToken string          `json:"refreshToken"`
+		ExpiresAt    json.RawMessage `json:"expiresAt"`
+		Domain       string          `json:"domain"`
+		ApiHost      string          `json:"apiHost"`
+		MachineID    string          `json:"machineId"`
+		DeviceID     string          `json:"deviceId"`
+		Cookies      []Cookie        `json:"cookies"`
+		UID          string          `json:"uid"`
+		EnterpriseID string          `json:"enterpriseId"`
+		Nickname     string          `json:"nickname"`
+		Weight       int             `json:"weight"`
+		Note         string          `json:"note"`
 	}
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -271,7 +283,7 @@ func parseFlat(raw []byte) (*Auth, error) {
 	return &Auth{
 		AccessToken:  f.AccessToken,
 		RefreshToken: f.RefreshToken,
-		ExpiresAt:    f.ExpiresAt,
+		ExpiresAt:    parseExpiresAtRaw(f.ExpiresAt),
 		Domain:       f.Domain,
 		ApiHost:      f.ApiHost,
 		MachineID:    f.MachineID,
@@ -309,10 +321,70 @@ func Parse(raw []byte) (*Auth, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(a.AccessToken) == "" {
-		return nil, fmt.Errorf("parse_error: missing accessToken")
+	if err := a.normalizeIdentity(); err != nil {
+		return nil, err
+	}
+	// refresh-only 账号（只有 refreshToken、accessToken 为空）允许加载：
+	// 由 RefreshTokenIfNeeded 在首次使用时换出 accessToken。
+	if strings.TrimSpace(a.AccessToken) == "" && strings.TrimSpace(a.RefreshToken) == "" {
+		return nil, fmt.Errorf("parse_error: missing accessToken and refreshToken")
 	}
 	return a, nil
+}
+
+// normalizeIdentity 归一化账号标识字段：
+//   - 去掉 token / uid 两端空白；
+//   - uid 缺失时从 accessToken（JWT）的 data.id 推导；
+//   - uid 非空时必须通过 ValidateUID（防路径穿越）。
+//
+// uid 完全推不出来时保持空串（历史文件兼容），是否可用由调度层判定。
+func (a *Auth) normalizeIdentity() error {
+	a.AccessToken = strings.TrimSpace(a.AccessToken)
+	a.RefreshToken = strings.TrimSpace(a.RefreshToken)
+	a.UID = strings.TrimSpace(a.UID)
+	if a.UID == "" && a.AccessToken != "" {
+		if info := ParseJWT(a.AccessToken); info.UID != "" {
+			a.UID = strings.TrimSpace(info.UID)
+		}
+	}
+	if a.UID != "" {
+		if err := ValidateUID(a.UID); err != nil {
+			return fmt.Errorf("parse_error: %w", err)
+		}
+	}
+	return nil
+}
+
+// parseExpiresAtRaw 兼容三种 expiresAt 形态：
+//
+//	1793756328（秒，数字）、"1793756328612"（毫秒，字符串）、1793756328612（毫秒，数字）。
+//
+// 统一归一化为 Unix 秒；无法解析/非正数返回 0（视为未知有效期）。
+func parseExpiresAtRaw(raw json.RawMessage) int64 {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return 0
+	}
+	s = strings.Trim(strings.TrimSpace(s), `"`)
+	if s == "" {
+		return 0
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || v <= 0 {
+		// 兼容浮点写法（1793756328.0）
+		f, ferr := strconv.ParseFloat(s, 64)
+		if ferr != nil || f <= 0 {
+			return 0
+		}
+		v = int64(f)
+	}
+	if v > 1e11 { // 毫秒
+		v /= 1000
+	}
+	if v <= 0 {
+		return 0
+	}
+	return v
 }
 
 // SaveAtomic 以嵌套形原子写回 FilePath（tmp + rename，0600），保持登录脚本可读格式。
@@ -359,16 +431,118 @@ func (a *Auth) saveAtomicLocked() error {
 	if err != nil {
 		return err
 	}
+	// 先写临时文件 + fsync，再 rename，最后 fsync 父目录：保证 refresh token
+	// 轮换后即使进程/机器崩溃也不会丢盘。
 	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	if err := writeFileSync(tmp, raw); err != nil {
+		removeQuiet(tmp)
 		return err
 	}
-	return os.Rename(tmp, a.FilePath)
+	if err := os.Rename(tmp, a.FilePath); err != nil {
+		removeQuiet(tmp)
+		return err
+	}
+	return syncDir(filepath.Dir(a.FilePath))
+}
+
+// writeFileSync 写入文件并 fsync 到磁盘，权限固定 0600（覆盖已有文件也强制收敛）。
+func writeFileSync(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	// 临时文件若已存在（上一次崩溃遗留）也强制收敛到 0600。
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+// syncDir 把 rename 产生的目录元数据刷盘。部分文件系统不支持目录 fsync（EINVAL 等），
+// 这类错误按尽力而为忽略；打开失败仍上报。
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		return nil
+	}
+	return nil
+}
+
+// removeQuiet 清理临时文件，失败忽略（rename 前失败时不留下脏文件）。
+func removeQuiet(path string) { _ = os.Remove(path) }
+
+// MaxUIDLen 是账号 UID 允许的最大长度。
+const MaxUIDLen = 64
+
+// ValidateUID 校验账号 UID 是否可安全用于文件名：
+// 非空、长度 1..MaxUIDLen、只含 [A-Za-z0-9_-]。
+//
+// UID 来自导入文件与查询参数，而 UID 会拼进 trae-{uid}.json 文件名；
+// 不校验时 uid="../../etc/passwd" 就能越出 authDir（读写删全部可命中）。
+func ValidateUID(uid string) error {
+	if uid == "" {
+		return fmt.Errorf("invalid uid: empty")
+	}
+	if len(uid) > MaxUIDLen {
+		return fmt.Errorf("invalid uid: too long (%d > %d)", len(uid), MaxUIDLen)
+	}
+	for i := 0; i < len(uid); i++ {
+		c := uid[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '_', c == '-':
+		default:
+			return fmt.Errorf("invalid uid: illegal character %q at %d", c, i)
+		}
+	}
+	return nil
+}
+
+// SafeFilePathFor 校验 UID 后构造 trae-{uid}.json 落盘路径；非法 UID 返回 error。
+// 调用方必须处理 error（不要退化成 FilePathFor 的空串）。
+func SafeFilePathFor(authDir, uid string) (string, error) {
+	if err := ValidateUID(uid); err != nil {
+		return "", err
+	}
+	dir := strings.TrimSpace(authDir)
+	if dir == "" {
+		return "", fmt.Errorf("empty auth dir")
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	absFP, err := filepath.Abs(filepath.Join(dir, "trae-"+uid+".json"))
+	if err != nil {
+		return "", err
+	}
+	// 双保险：清理后的路径必须直接落在 authDir 下（防平台相关的路径解释差异）。
+	if filepath.Dir(absFP) != filepath.Clean(absDir) {
+		return "", fmt.Errorf("invalid uid %q: path escapes auth dir", uid)
+	}
+	return filepath.Join(dir, "trae-"+uid+".json"), nil
 }
 
 // FilePathFor 在已知 AuthDir 时构造 trae-{uid}.json 落盘路径。
+// UID 非法时返回空串 ""（保留历史签名；新代码请用 SafeFilePathFor 并处理 error）。
 func FilePathFor(authDir, uid string) string {
-	return filepath.Join(authDir, "trae-"+uid+".json")
+	fp, err := SafeFilePathFor(authDir, uid)
+	if err != nil {
+		return ""
+	}
+	return fp
 }
 
 // MaskToken 保留前 n 字符 + 省略号；不足则全显示。用于面板 JSON 预览脱敏。
@@ -379,24 +553,36 @@ func MaskToken(s string, n int) string {
 	return s[:n] + "…(" + strconv.Itoa(len(s)) + " chars)"
 }
 
-// LoadDir 扫描 dir 下 trae-*.json。解析失败的文件静默跳过（启动日志由调用方统计）。
+// LoadDir 扫描 dir 下 trae-*.json。
+//
+// 解析失败的文件不再静默跳过：每个失败文件打一条日志（文件名 + 原因），
+// 最后汇总一条"加载 N 个 / 跳过 M 个"。成功解析的照常返回，
+// 单个坏文件不会让账号凭空消失且无人知晓。
 func LoadDir(dir string) ([]*Auth, error) {
 	files, err := filepath.Glob(filepath.Join(dir, "trae-*.json"))
 	if err != nil {
 		return nil, err
 	}
 	var out []*Auth
+	var skipped int
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
+			skipped++
+			log.Printf("auth: skip %s: read failed: %v", f, err)
 			continue
 		}
 		a, err := Parse(raw)
 		if err != nil {
+			skipped++
+			log.Printf("auth: skip %s: parse failed: %v", f, err)
 			continue
 		}
 		a.FilePath = f
 		out = append(out, a)
+	}
+	if skipped > 0 {
+		log.Printf("auth: loaded %d account(s) from %s, skipped %d bad file(s)", len(out), dir, skipped)
 	}
 	return out, nil
 }

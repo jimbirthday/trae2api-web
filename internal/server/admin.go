@@ -1,4 +1,6 @@
-// 管理面板（/admin）：只读查询，无鉴权（本地面板）；CLI 操作留待开发。
+// 管理面板（/admin）：页面与全部 /admin/api/* 都要求持有 API Key（Bearer 或登录 cookie）。
+//
+// 详见 admingate.go：TW2A_API_KEY 为空时才退化为不鉴权（本地裸跑场景）。
 package server
 
 import (
@@ -28,6 +30,15 @@ func (h *Handler) adminPageGated(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) adminPage(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
+	// 面板不允许被 iframe 嵌入（防点击劫持），并禁止 MIME 嗅探。
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	// 内联脚本/样式是面板的既定实现（无外部依赖），因此 CSP 只能放开 inline；
+	// 但把 connect-src/frame-ancestors 收紧，仍能挡掉外部脚本注入与嵌套。
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "+
+			"img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
 	_, _ = w.Write(adminPageHTML)
 }
 
@@ -165,14 +176,14 @@ func (h *Handler) fetchCredits() []creditRow {
 				ac.Error = "ent_usage: " + err.Error()
 			} else {
 				ac.Remain, ac.Limit, ac.Used, ac.Packs = remain, limit, used, packs
-				// 回写 pool：查询额度是刷新调度状态的机会，不回写会导致面板显示
-				// 4743 而选号权重仍按旧值（甚至 0）计算，且冷却号不会自动解冻。
+				// 回写 pool 的**余额**：不回写会让面板显示 4743 而选号权重仍按旧值计算。
+				// 注意：这里是 GET 查询路径，绝不改冷却/熔断状态——否则「打开面板」
+				// 就等于「给所有冷却号解冻」，一次误点就绕过了调度保护。
 				total := limit
 				if total < remain {
 					total = remain
 				}
-				h.cfg.Pool.SetCreditsDetailed(s.UID, remain, total, 0, time.Time{}, 0)
-				h.cfg.Pool.ReenableIfCredits(s.UID, remain)
+				h.cfg.Pool.UpdateCreditsFromQuery(s.UID, remain, total)
 			}
 			checkedIn, credits, enable, cerr := h.cfg.Upstream.CheckinStatus(a)
 			if cerr != nil {
@@ -181,7 +192,10 @@ func (h *Handler) fetchCredits() []creditRow {
 				}
 				ac.Error += "checkin: " + cerr.Error()
 			} else {
-				ac.CheckedIn, ac.CheckinCredits, ac.CheckinEnable = checkedIn, credits, enable
+				// 本地按天记录的签到状态一并纳入：上游偶尔不回 checked_in，
+				// 本地日期戳能保证「今天签过」的号不会一直显示未签到。
+				ac.CheckedIn = checkedIn || h.cfg.Pool.CheckinDoneToday(s.UID)
+				ac.CheckinCredits, ac.CheckinEnable = credits, enable
 			}
 			out[i] = ac
 		}(i, s)

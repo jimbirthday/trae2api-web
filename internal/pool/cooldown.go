@@ -25,8 +25,10 @@ func (p *Pool) Cooldown(uid string, kind CoolKind, d time.Duration, reason strin
 		e.until = until
 		e.coolKind = kind.String()
 		e.reason = reason
+		e.reasonIsManual = false
 	} else if e.reason == "" {
 		e.reason = reason
+		e.reasonIsManual = false
 	}
 	e.errCount = 0
 	if kind != CoolSoft {
@@ -71,8 +73,13 @@ func (p *Pool) CooldownSoftRate(uid string, base time.Duration, resetAt time.Tim
 	if until.After(e.until) {
 		e.until = until
 		e.reason = reason
+		e.reasonIsManual = false
+		e.coolKind = CoolSoft.String()
 	}
-	e.coolKind = CoolSoft.String()
+	// 关键：只有在**真的延长了**冷却时才改写 coolKind。旧实现无条件覆盖成
+	// "soft_rate"，会把一条 12h 的 plan 冷却错标成限流冷却；而额度回血解冻
+	// （ReenableIfCredits）正是按 coolKind 判定「是否额度型」，错标就直接
+	// 把 l2 小时的长冷却提前放掉了。
 	e.errCount = 0
 	p.markDirtyLocked()
 }

@@ -61,21 +61,27 @@ func ParseRelay(raw []byte) ([]*Auth, error) {
 	return out, nil
 }
 
-// LooksLikeRelay 判断一段 JSON 是否是第三方导出格式（而非本仓库嵌套形）。
-// 判据：含 "accounts" 数组，或含 "token" / "refresh_token" / "refreshToken"
-// （后两个分别是格式 B 与格式 A 的 refreshToken 命名）。
-// 本仓库嵌套形（含 "auth" 键且无 "accounts"）不在此列，由调用方另行排除。
+// LooksLikeRelay 判断一段 JSON 是否是第三方导出格式（而非本仓库扁平/嵌套形）。
+//
+// 判据只认「批量或中转格式 B 的独有形状」：
+//   - 顶层有 "accounts" 数组（两种批量格式都是这个外壳）
+//   - 顶层有 "token"（格式 A 单条 / 格式 B 单条）
+//   - 顶层有 "refresh_token"（格式 B 单条，snake_case）
+//
+// 刻意**不**把 "refreshToken"（驼峰）当判据：本仓库自己导出的扁平形
+// {"uid":..,"accessToken":..,"refreshToken":..} 也带这个键，若据此判成批量，
+// 单账号导入会被塞进批量通道、走中继解析器而丢掉 uid。
+// 格式 A 的驼峰 refreshToken 一定伴随 "token"，上面第二条已经覆盖。
 func LooksLikeRelay(raw []byte) bool {
 	var probe struct {
-		Accounts     []json.RawMessage `json:"accounts"`
-		Token        *string           `json:"token"`
-		Refresh      *string           `json:"refresh_token"`
-		RefreshCamel *string           `json:"refreshToken"`
+		Accounts []json.RawMessage `json:"accounts"`
+		Token    *string           `json:"token"`
+		Refresh  *string           `json:"refresh_token"`
 	}
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return false
 	}
-	return len(probe.Accounts) > 0 || probe.Token != nil || probe.Refresh != nil || probe.RefreshCamel != nil
+	return len(probe.Accounts) > 0 || probe.Token != nil || probe.Refresh != nil
 }
 
 func parseRelayOne(raw []byte) (*Auth, error) {
@@ -98,13 +104,17 @@ func parseRelayOne(raw []byte) (*Auth, error) {
 		}
 	}
 	var m struct {
-		UserID        string          `json:"user_id"`
-		ID            string          `json:"id"`
-		Label         string          `json:"label"`
-		Nickname      string          `json:"nickname"`
-		Name          string          `json:"name"` // 格式 A
-		Token         string          `json:"token"`
+		UserID   string `json:"user_id"`
+		UID      string `json:"uid"` // 本仓库扁平形的字段名，混在批量数组里时也要认
+		ID       string `json:"id"`
+		Label    string `json:"label"`
+		Nickname string `json:"nickname"`
+		Name     string `json:"name"` // 格式 A
+		Token    string `json:"token"`
+		// access_token（snake）与 accessToken（camel）都认：前者是格式 B，
+		// 后者是本仓库扁平形，二者可能出现在同一个 accounts 数组里。
 		AccessToken   string          `json:"access_token"`
+		AccessTokenCC string          `json:"accessToken"`
 		RefreshToken  string          `json:"refresh_token"`
 		RefreshCamel  string          `json:"refreshToken"` // 格式 A（驼峰）
 		ExpiredAt     json.RawMessage `json:"expired_at"`
@@ -124,10 +134,21 @@ func parseRelayOne(raw []byte) (*Auth, error) {
 		token = strings.TrimSpace(m.AccessToken)
 	}
 	if token == "" {
+		token = strings.TrimSpace(m.AccessTokenCC)
+	}
+	refresh := strings.TrimSpace(m.RefreshToken)
+	if refresh == "" {
+		refresh = strings.TrimSpace(m.RefreshCamel)
+	}
+	// refresh-only 账号（只有 refreshToken）允许导入：首次调用时再换取 accessToken。
+	if token == "" && refresh == "" {
 		return nil, fmt.Errorf("relay_parse_error: missing token")
 	}
 	meta := ParseJWT(token)
 	uid := strings.TrimSpace(m.UserID)
+	if uid == "" {
+		uid = strings.TrimSpace(m.UID)
+	}
 	if uid == "" {
 		uid = strings.TrimSpace(m.ID)
 	}
@@ -147,10 +168,6 @@ func parseRelayOne(raw []byte) (*Auth, error) {
 			n = n[len(n)-4:]
 		}
 		nick = "用户" + n
-	}
-	refresh := strings.TrimSpace(m.RefreshToken)
-	if refresh == "" {
-		refresh = strings.TrimSpace(m.RefreshCamel)
 	}
 	exp := parseEpochSec(m.ExpiredAt)
 	if exp == 0 {
@@ -173,6 +190,10 @@ func parseRelayOne(raw []byte) (*Auth, error) {
 	}
 	if h := normalizeHost(m.Host); h != "" {
 		a.ApiHost = h
+	}
+	// 统一归一化：token 去空白、uid 缺失时从 JWT 推导、uid 必须通过 ValidateUID。
+	if err := a.normalizeIdentity(); err != nil {
+		return nil, fmt.Errorf("relay_parse_error: %w", err)
 	}
 	if m.Enabled != nil && !*m.Enabled {
 		a.ImportDisabled = true // 由导入层转成 pool 的 disabled 状态

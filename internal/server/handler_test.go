@@ -20,10 +20,25 @@ const soloSSE = "event:metadata\ndata:{\"model\":\"\",\"session_id\":\"s1\"}\n\n
 	"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
 
 // newFakeUpstream 返回 ChatStream 走 fake 的 upstream.Client。
+// fakeModelsBody 拉模型表（get_detail_param）用的固定响应。
+//
+// 为什么不走 behavior：拉模型表是辅助调用，走 behavior 会让每个用例的
+// behavior 被额外调用一次（计数类断言随机多算一条，用例因此间隔性失败）。
+const fakeModelsBody = `{"config_info_list":[
+	{"config_name":"glm-5.2","display_config":{"display_name":"GLM-5.2"}},
+	{"config_name":"DeepSeek-V4-Pro","display_config":{"display_name":"DeepSeek V4 Pro"}}]}`
+
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {
 	t.Helper()
 	return &upstream.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "get_detail_param") {
+				return &http.Response{
+					StatusCode: 200,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(fakeModelsBody)),
+				}, nil
+			}
 			authz := r.Header.Get("Authorization")
 			status, body, isStream := behavior(authz)
 			ct := "application/json"
@@ -128,7 +143,7 @@ func TestChatRotatesOnPlanLimit(t *testing.T) {
 	p.SetCredits("bad", 2000, 2000)
 	p.SetCredits("good", 1000, 1000)
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
@@ -136,7 +151,7 @@ func TestChatRotatesOnPlanLimit(t *testing.T) {
 	}
 	// 选号是加权随机，无法预知首次命中哪个号；循环到 plan-limit 账号被命中为止。
 	for i := 0; i < 100 && calls["Cloud-IDE-JWT at-bad"] == 0; i++ {
-		req = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+		req = httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 		rec = httptest.NewRecorder()
 		h.ServeHTTP(rec, req)
 		if rec.Code != 200 {
@@ -163,7 +178,7 @@ func TestChatStreamCooldownOnStreamError(t *testing.T) {
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	// 流内错误不应中断整个请求的 SSE 输出（仍有 event:error + [DONE]）。
@@ -185,7 +200,7 @@ func TestChatAllUnavailableReturns503(t *testing.T) {
 		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
 		Upstream: up,
 	})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 503 {
@@ -204,7 +219,7 @@ func TestChatSessionDeadDisables(t *testing.T) {
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	h := NewHandler(Config{Pool: p, Upstream: up})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 503 {
@@ -218,7 +233,7 @@ func TestChatSessionDeadDisables(t *testing.T) {
 
 func TestChatUnknownModel400(t *testing.T) {
 	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
-	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"does-not-exist-xyz","messages":[]}`))
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"does-not-exist-xyz","messages":[{"role":"user","content":"hi"}]}`))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 	if rec.Code != 400 {

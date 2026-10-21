@@ -36,10 +36,9 @@ func (p *Pool) peekCommit(uid, reqModel string) *auth.Auth {
 	if !ok {
 		return nil
 	}
-	if !e.healthyForModel(nowFunc(), reqModel) {
-		return nil
-	}
-	if int(p.maxInFlight.Load()) > 0 && int(e.inFlight.Load()) >= int(p.maxInFlight.Load()) {
+	// 与选号同口径：余额地板/暂停/冷却/在途都要挡掉，否则 Peek 会返回一个
+	// Pick 根本不会选的号，辅助调用（拉模型表）就会打在「本该休息」的号上。
+	if !p.routableLocked(e, nowFunc(), reqModel) {
 		return nil
 	}
 	return e.a

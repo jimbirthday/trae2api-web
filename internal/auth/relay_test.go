@@ -194,3 +194,60 @@ func TestParseJWTInvalid(t *testing.T) {
 		t.Fatalf("%+v", info)
 	}
 }
+
+// 本仓库自己导出的「扁平单账号」JSON 不能被当成批量中继格式。
+//
+// 历史缺陷：LooksLikeRelay 曾把 refreshToken（驼峰）当判据，而扁平导出形
+// {"uid":..,"accessToken":..,"refreshToken":..} 正好带这个键，于是单账号导入
+// 被塞进批量通道、走中继解析器，uid 丢失 → "cannot determine uid"。
+func TestLooksLikeRelayRejectsOwnFlatExport(t *testing.T) {
+	flat := []byte(`{"uid":"4122538516165401","accessToken":"at","refreshToken":"rt","nickname":"n"}`)
+	if LooksLikeRelay(flat) {
+		t.Fatal("本仓库扁平导出形被误判为批量中继格式")
+	}
+	if HasAccounts(flat) {
+		t.Fatal("HasAccounts 不应把扁平单账号当成批量")
+	}
+	a, err := Parse(flat)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if a.UID != "4122538516165401" {
+		t.Fatalf("uid=%q", a.UID)
+	}
+
+	// 反过来：真正的中继/批量格式必须仍然被识别（否则批量导入会退化）。
+	for _, s := range []string{
+		`{"accounts":[{"token":"t"}]}`,
+		`{"user_id":"1","label":"l","token":"t","refresh_token":"rt"}`,
+		`{"name":"账号461","token":"t","refreshToken":"rt","cookies":[]}`,
+	} {
+		if !LooksLikeRelay([]byte(s)) {
+			t.Fatalf("应识别为中继格式: %s", s)
+		}
+		if !HasAccounts([]byte(s)) {
+			t.Fatalf("HasAccounts 应为 true: %s", s)
+		}
+	}
+}
+
+// accounts 数组里混放本仓库扁平形时，uid 必须被读出来（而不是只认 user_id/id）。
+func TestParseRelayAcceptsFlatUIDInArray(t *testing.T) {
+	raw := []byte(`{"accounts":[
+	  {"uid":"111","accessToken":"at1","refreshToken":"rt1","nickname":"a"},
+	  {"user_id":"222","label":"b","token":"a.b.c","refresh_token":"rt2"}
+	]}`)
+	list, err := ParseAnyAccounts(raw)
+	if err != nil {
+		t.Fatalf("ParseAnyAccounts: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("n=%d", len(list))
+	}
+	if list[0].UID != "111" || list[1].UID != "222" {
+		t.Fatalf("uids=%q,%q", list[0].UID, list[1].UID)
+	}
+	if list[0].AccessToken != "at1" || list[1].AccessToken != "a.b.c" {
+		t.Fatalf("tokens=%q,%q", list[0].AccessToken, list[1].AccessToken)
+	}
+}

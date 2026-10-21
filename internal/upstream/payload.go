@@ -3,6 +3,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"log"
 	"strings"
 )
 
@@ -28,6 +29,15 @@ func PrepareBody(src []byte) []byte {
 	}
 	obj["stream"] = true
 	obj["function"] = Function
+
+	// max_completion_tokens 是 OpenAI 新字段（o1/reasoning 模型），上游只认
+	// max_tokens。两者都给时以 max_completion_tokens 为准（OpenAI 语义：新字段
+	// 覆盖旧字段）。保留 max_tokens 会让上游按旧值截断，导致「同样的 max_tokens
+	// 在别家网关能用、这里提前 stop」。
+	if v, ok := obj["max_completion_tokens"]; ok {
+		obj["max_tokens"] = v // 新字段覆盖旧字段
+		delete(obj, "max_completion_tokens")
+	}
 	// stream_options 是 OpenAI 的下游语义（是否回传 usage），由本服务处理；
 	// 上游 SOLO 不认这个字段，转发过去可能被判非法参数，必须剥掉。
 	delete(obj, "stream_options")
@@ -98,6 +108,7 @@ func PrepareBody(src []byte) []byte {
 
 	normalizeToolChoice(obj)
 	normalizeTools(obj)
+	dropUnsupported(obj)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src
@@ -195,4 +206,33 @@ func normalizeTools(obj map[string]any) {
 		return
 	}
 	obj["tools"] = out
+}
+
+// unsupportedFields 上游 llm_utils_chat 不接受、且我们也没做映射的 OpenAI 参数。
+//
+// 为什么选择「丢弃而不是透传」：SOLO 的 Go struct 对未知字段是严格解码，
+// 多一个字段整条请求直接 4xx（实测），客户端会看到莫名其妙的参数错误。
+// 为什么选择「丢弃而不是假装支持」：这些字段语义（多候选、对数概率、随机种子、
+// 强制并行工具调用、结构化输出）在上游完全没有对应实现，静默假装支持会让
+// 客户端拿到不符合 request 语义的结果。折中是：丢弃 + 打一行日志，让使用者
+// 知道「这次请求的这几个参数没生效」，而不是无声无息地偏离。
+var unsupportedFields = []string{
+	"n", "logprobs", "top_logprobs", "logit_bias", "seed",
+	"parallel_tool_calls", "response_format", "service_tier",
+	"store", "metadata", "moderation", "prediction", "audio", "web_search_options",
+}
+
+// dropUnsupported 删除上游不支持的可选参数，并记录被忽略的字段名。
+func dropUnsupported(obj map[string]any) {
+	var dropped []string
+	for _, k := range unsupportedFields {
+		if _, ok := obj[k]; ok {
+			delete(obj, k)
+			dropped = append(dropped, k)
+		}
+	}
+	if len(dropped) > 0 {
+		// 用标准 log 而非 fmt：这行是运维排查依据，必须进容器日志。
+		log.Printf("INFO: [upstream] ignored unsupported params: %v", dropped)
+	}
 }

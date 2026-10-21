@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http/httptest"
@@ -227,10 +228,11 @@ func TestStreamConvertsToOpenAIChunks(t *testing.T) {
 
 func TestStreamGuaranteesDone(t *testing.T) {
 	rec := httptest.NewRecorder()
-	// 上游中断（只有 output，无 done）
+	// 上游中断（只有 output，无 done）：客户端仍要收到 [DONE] 才能结束解析，
+	// 但函数必须把「截断」告诉调用方，否则半句话会被当成成功回复。
 	err := Stream(rec, strings.NewReader("event:output\ndata:{\"response\":\"x\",\"reasoning_content\":\"\",\"tool_calls\":null}\n\n"))
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrTruncatedStream) {
+		t.Fatalf("want ErrTruncatedStream, got %v", err)
 	}
 	if !strings.Contains(rec.Body.String(), "data: [DONE]") {
 		t.Errorf("missing [DONE]: %q", rec.Body.String())
@@ -463,7 +465,8 @@ func TestAggregateHandlesSnapshotsAndModel(t *testing.T) {
 func TestStreamForwardsHeartbeatAsComment(t *testing.T) {
 	sse := "event:heartbeat\ndata:{}\n\n" +
 		"event:progress_notice\ndata:{\"text\":\"排队中\"}\n\n" +
-		"event:output\ndata:{\"response\":\"hi\",\"reasoning_content\":\"\"}\n\n"
+		"event:output\ndata:{\"response\":\"hi\",\"reasoning_content\":\"\"}\n\n" +
+		"event:done\ndata:{\"finish_reason\":\"stop\"}\n\n"
 	rec := httptest.NewRecorder()
 	if err := Stream(rec, strings.NewReader(sse)); err != nil {
 		t.Fatal(err)

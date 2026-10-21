@@ -15,6 +15,7 @@
 package pool
 
 import (
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,6 +30,15 @@ type Pool struct {
 	stateFp string
 
 	limits Limits
+
+	// leases 记录「在途租约」的所有权：token → uid。
+	//
+	// 为什么需要：旧实现只有每账号的原子计数，Release(uid) 谁调都能减一。
+	// 于是 A 请求结束时的 Release("u1") 可能把 B 请求还没用完的名额释放掉，
+	// 该账号的实际并发就会短暂超过上限（上游更容易 429）。
+	// 现在每个 Acquire 发一个不可猜测的 token，Release 只认自己持有的那个。
+	leaseSeq uint64
+	leases   map[string]string
 	// maxInFlight 是 limits.MaxInFlight 的 atomic 副本：Acquire 热路径不取 p.mu。
 	maxInFlight atomic.Int32
 
@@ -56,6 +66,7 @@ func New(stateFp string) *Pool {
 		byUID:   map[string]*entry{},
 		stateFp: stateFp,
 		limits:  defaultLimits(),
+		leases:  map[string]string{},
 	}
 	p.maxInFlight.Store(int32(p.limits.MaxInFlight))
 	if stateFp != "" {
@@ -75,7 +86,37 @@ func (p *Pool) SetLimits(l Limits) {
 	p.maxInFlight.Store(int32(l.MaxInFlight))
 }
 
-// Add 加入账号；已存在则保留原运行状态（credits/冷却/开关），只更新凭证。
+// credentialChanged 报告「新旧凭证是否确实不同」。
+//
+// 冷却是「这个账号被打坏了」的结论，只有换了凭证（重登/换号）才失效。但启动时
+// 从 state.json 恢复出来的占位 Auth 没有任何 token，此时 Add 用真实凭证替换它
+// 显然不是「换号」——若在这条路径上也清锁，重启就等于把所有坏号洗白（正是
+// 持久化要解决的问题）。因此只有「新旧都有凭证且至少一项不同」才算换号。
+func credentialChanged(oldA, newA *auth.Auth) bool {
+	if oldA == nil || newA == nil {
+		return false
+	}
+	oldAccess, oldRefresh := oldA.AccessTokenValue(), oldA.RefreshTokenValue()
+	newAccess, newRefresh := newA.AccessTokenValue(), newA.RefreshTokenValue()
+	if newAccess == "" && newRefresh == "" {
+		return false
+	}
+	if oldAccess == "" && oldRefresh == "" {
+		return false
+	}
+	return oldAccess != newAccess || oldRefresh != newRefresh
+}
+
+// Add 加入账号。
+//
+// 已存在时：
+//   - 凭证确实换了（重登/重新导入）→ 清掉自动锁（冷却/熔断/软退避/连败降权/
+//     错误计数）。否则重登一个 session 失效的号，它依旧躺在 12h plan 冷却里，
+//     运维会以为导入没生效。
+//   - 凭证没变（启动恢复时用真实凭证替换占位）→ 保留全部状态。
+//
+// 两种情况都保留 tokenUsage（账号历史事实）与 credits（余额由上游权威给出），
+// 也不动 enabled/paused（那是人的意图）。
 func (p *Pool) Add(a *auth.Auth) {
 	if a == nil || a.UID == "" {
 		return
@@ -83,6 +124,9 @@ func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[a.UID]; ok {
+		if credentialChanged(e.a, a) {
+			e.clearAutoLocksLocked()
+		}
 		e.a = a
 		p.markDirtyLocked()
 		return
@@ -123,6 +167,13 @@ func (p *Pool) Remove(uid string) bool {
 		return false
 	}
 	delete(p.byUID, uid)
+	// 同时回收该账号尚未归还的租约：否则 leases 表会永久残留已删账号的条目，
+	// 长跑（反复增删账号）会持续吃内存。
+	for t, u := range p.leases {
+		if u == uid {
+			delete(p.leases, t)
+		}
+	}
 	p.markDirtyLocked()
 	return true
 }
@@ -139,30 +190,95 @@ func (p *Pool) entryOf(uid string) *entry {
 // 在途租约
 // ---------------------------------------------------------------------------
 
-// Acquire 抢占一个在途名额：CAS 自增，满/不存在返回 false。
-// MaxInFlight<=0 时恒 true（租约关闭）。
-func (p *Pool) Acquire(uid string) bool {
+// AcquireLease 抢占一个在途名额，返回租约令牌；满/账号不存在返回 ok=false。
+// MaxInFlight<=0 时仍然发令牌（计数关闭，但租约所有权语义保留）。
+//
+// 新代码请用 ReleaseToken 归还。之所以不直接把 Acquire 改成双返回值：全仓库有
+// 6 处调用点在 server 包，签名一改就会让与本次改动无关的包编译失败。因此保留
+// Acquire(uid) bool 作为兼容壳，逐步迁移到 AcquireLease/ReleaseToken。
+func (p *Pool) AcquireLease(uid string) (string, bool) {
 	e := p.entryOf(uid)
 	if e == nil {
-		return false
+		return "", false
 	}
 	limit := int(p.maxInFlight.Load())
-	if limit <= 0 {
-		return true
-	}
-	for {
-		cur := e.inFlight.Load()
-		if cur >= int32(limit) {
-			return false
+	if limit > 0 {
+		for {
+			cur := e.inFlight.Load()
+			if cur >= int32(limit) {
+				return "", false
+			}
+			if e.inFlight.CompareAndSwap(cur, cur+1) {
+				goto granted
+			}
 		}
-		if e.inFlight.CompareAndSwap(cur, cur+1) {
-			return true
-		}
+	} else {
+		e.inFlight.Add(1)
 	}
+granted:
+	p.mu.Lock()
+	p.leaseSeq++
+	token := uid + "#" + strconv.FormatUint(p.leaseSeq, 10)
+	p.leases[token] = uid
+	p.mu.Unlock()
+	return token, true
 }
 
-// Release 归还一个在途名额：CAS 自减并 clamp 到 0（重复调用安全）。
+// Acquire 兼容壳：抢占名额但丢弃令牌（用 Release(uid) 归还）。
+//
+// 它仍然会在 leases 表里登记一个真实租约，因此 A 请求的 Release 不会误释放
+// 属于另一个 uid 的租约；但同一 uid 上有并发请求时无法区分彼此，这正是需要
+// 迁移到 AcquireLease/ReleaseToken 的原因。
+func (p *Pool) Acquire(uid string) bool {
+	_, ok := p.AcquireLease(uid)
+	return ok
+}
+
+// ReleaseToken 归还自己持有的租约；未知/重复的 token 一律忽略（幂等）。
+func (p *Pool) ReleaseToken(token string) {
+	if token == "" {
+		return
+	}
+	p.mu.Lock()
+	uid, ok := p.leases[token]
+	if ok {
+		delete(p.leases, token)
+	}
+	p.mu.Unlock()
+	if !ok {
+		return
+	}
+	p.decInFlight(uid)
+}
+
+// Release 兼容壳：释放该 UID 的任意一个在途租约。
+//
+// 语义上不如 ReleaseToken 精确（它无法判断这个名额属于哪个请求），保留它只是
+// 为了让尚未改造的调用点继续工作。新代码必须用 ReleaseToken。
 func (p *Pool) Release(uid string) {
+	p.mu.Lock()
+	token := ""
+	for t, u := range p.leases {
+		if u == uid {
+			token = t
+			break
+		}
+	}
+	if token != "" {
+		delete(p.leases, token)
+	}
+	p.mu.Unlock()
+	if token == "" {
+		// 没有该 UID 的租约 = 重复释放或根本没 Acquire 过。
+		// **绝不能**在这里盲减计数：重复 Release 会把同一账号上另一个请求的
+		// 名额减掉，实际并发就会突破上限（旧实现正是这么漏的）。
+		return
+	}
+	p.decInFlight(uid)
+}
+
+// decInFlight 把一个账号的在途数减一并 clamp 到 0。
+func (p *Pool) decInFlight(uid string) {
 	e := p.entryOf(uid)
 	if e == nil {
 		return
@@ -176,6 +292,14 @@ func (p *Pool) Release(uid string) {
 			return
 		}
 	}
+}
+
+// LeaseCount 当前未归还的租约数（诊断/测试用）。
+func (p *Pool) LeaseCount() int {
+	p.mu.RLock()
+	n := len(p.leases)
+	p.mu.RUnlock()
+	return n
 }
 
 // InFlight 返回当前在途数。

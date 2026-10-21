@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -355,4 +356,104 @@ func TestArchiveTotal(t *testing.T) {
 	if n, ok := r.ArchiveTotal(Filter{}); !ok || n != 120 {
 		t.Fatalf("cached total=%d ok=%v", n, ok)
 	}
+}
+
+func TestOutcomeFilterIsExactForKnownValues(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Dir: dir, Enabled: true, RetainDays: 3})
+	now := time.Now()
+	r.Record(Event{Time: now.Add(-4 * time.Second), Outcome: OutcomeSuccess, Status: 200})
+	r.Record(Event{Time: now.Add(-3 * time.Second), Outcome: OutcomeHTTPError, Status: 502})
+	r.Record(Event{Time: now.Add(-2 * time.Second), Outcome: OutcomeStreamError, Status: 200})
+	r.Record(Event{Time: now.Add(-time.Second), Outcome: OutcomeInterrupted})
+	// 历史别名应归一为 interrupted 后被筛出。
+	r.Record(Event{Time: now, Outcome: OutcomeClientCanceled})
+	r.Close() // flush 归档（写缓冲只在滚动/关闭时落盘）
+
+	// 已知常量必须精确匹配："stream_error" 不能把 http_error 也带出来。
+	if got, _ := r.ReadArchive(0, Filter{Outcome: OutcomeStreamError}); len(got) != 1 || got[0].Outcome != OutcomeStreamError {
+		t.Fatalf("stream_error filter got %d: %+v", len(got), got)
+	}
+	if got, _ := r.ReadArchive(0, Filter{Outcome: OutcomeHTTPError}); len(got) != 1 {
+		t.Fatalf("http_error filter got %d", len(got))
+	}
+	if got, _ := r.ReadArchive(0, Filter{Outcome: OutcomeInterrupted}); len(got) != 2 {
+		t.Fatalf("interrupted should include legacy alias, got %d", len(got))
+	}
+	// 自由文本仍走子串匹配（http_error + stream_error）。
+	if got, _ := r.ReadArchive(0, Filter{Outcome: "error"}); len(got) != 2 {
+		t.Fatalf("substring filter got %d", len(got))
+	}
+}
+
+func TestArchiveFilesArePrivate(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Dir: dir, Enabled: true, RetainDays: 3})
+	r.Record(Event{Path: "/v1/chat/completions", UID: "u1", Model: "m", Outcome: OutcomeSuccess, Status: 200})
+	r.Close()
+
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) == 0 {
+		t.Fatal("no archive file written")
+	}
+	for _, e := range ents {
+		info, err := e.Info()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if perm := info.Mode().Perm(); perm != 0o600 {
+			t.Errorf("%s perm=%o, want 600", e.Name(), perm)
+		}
+	}
+}
+
+func TestBeginIsIdempotent(t *testing.T) {
+	r := New(Config{})
+	end := r.Begin()
+	if got := r.Metrics().InFlight; got != 1 {
+		t.Fatalf("in_flight=%d", got)
+	}
+	end(Event{Outcome: OutcomeSuccess})
+	end(Event{Outcome: OutcomeSuccess})
+	end(Event{Outcome: OutcomeSuccess})
+	if got := r.Metrics().InFlight; got != 0 {
+		t.Fatalf("in_flight after multiple end=%d (should not go negative)", got)
+	}
+	if got := r.Metrics().Total; got != 1 {
+		t.Fatalf("total=%d, want 1 (end must only record once)", got)
+	}
+}
+
+func TestKnownOutcomesCovered(t *testing.T) {
+	for _, o := range KnownOutcomes() {
+		if !knownOutcomeSet[o] {
+			t.Errorf("KnownOutcomes contains %q not in knownOutcomeSet", o)
+		}
+	}
+	if canonicalOutcome(OutcomeClientCanceled) != OutcomeInterrupted {
+		t.Error("legacy alias not canonicalized")
+	}
+}
+
+func TestCloseStopsBackgroundGoroutines(t *testing.T) {
+	before := runtime.NumGoroutine()
+	dir := t.TempDir()
+	r := New(Config{Dir: dir, Enabled: true, RetainDays: 3})
+	for i := 0; i < 50; i++ {
+		r.Record(Event{Outcome: OutcomeSuccess, Path: "/v1/chat/completions"})
+	}
+	r.Close()
+	r.Close() // 幂等：重复 Close 不能 panic/重复关 channel
+	// 归档 goroutine（含 cleanup ticker）必须已退出。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= before+1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("goroutine leak: before=%d after=%d", before, runtime.NumGoroutine())
 }

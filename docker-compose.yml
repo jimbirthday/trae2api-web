@@ -1,5 +1,6 @@
-# 从源码构建并启动：docker compose up -d --build
-# 默认监听 host 8000 → 容器 8000。
+# 从源码构建并启动（唯一构建入口，不依赖宿主预编译二进制）：
+#   docker compose up -d --build
+# 默认监听 host 8000 → 容器 8000（宿主端口可用 TW2A_PORT 覆盖，容器内恒为 8000）。
 services:
   tw2api:
     build:
@@ -9,16 +10,50 @@ services:
     # 容器名可用 TW2A_CONTAINER_NAME 覆盖（同机跑多个实例时不冲突）
     container_name: ${TW2A_CONTAINER_NAME:-trae2api-web}
     restart: unless-stopped
+    # 优雅停机窗口：服务内部 15s 收尾在途流式请求，再 flush 持久化；
+    # docker 默认 10s 会在收尾中途 SIGKILL，导致 token 轮换/用量丢失。
+    stop_grace_period: 25s
     environment:
       - TZ=${TZ:-Asia/Shanghai}
       # 服务鉴权 key：务必改成自己的随机串（面板/API 都用它）
       - TW2A_API_KEY=${TW2A_API_KEY:-changeme}
       # 容器内固定 8000，与下面 ports 映射保持一致
       - TW2A_LISTEN=:8000
-      # TRAE 登录回调端口（容器内起 127.0.0.1:18080；面板手动粘贴回调链接时可忽略）
+      # TRAE 登录回调（两条路，二选一）：
+      #
+      # 路线 A（推荐，生产）：配公网地址，回调走你的域名/反代
+      #   把下面的 TW2A_PUBLIC_BASE_URL 设成 https://你的域名，并在反代里把
+      #   /authorize 转发到本容器 8000 端口。回调链接就是
+      #   https://你的域名/authorize —— 不需要额外映射任何端口。
+      #
+      # 路线 B（本机调式兜底）：映射独立的回调端口，靠宿主机 IP 直连
+      #   设 TW2A_CALLBACK_PORT=18080（默认），compose 会把该端口同时映射到宿主
+      #   进程仍需用「宿主机可达地址」访问（面板填写的地址不能是 127.0.0.1，
+      #   除非浏览器与服务在同一台机器）。
+      #
+      # 两者都不配时，回调 server 仍会在容器内 0.0.0.0:18080 起，但从容器外不可达，
+      # 登录会退化成「手动粘贴回调链接」。容器内监听地址固定 0.0.0.0（不能用
+      # 127.0.0.1，否则宿主/反代永远进不来）。
+      - TW2A_CALLBACK_BIND=${TW2A_CALLBACK_BIND:-0.0.0.0}
       - TW2A_CALLBACK_PORT=${TW2A_CALLBACK_PORT:-18080}
+      # 公网基址（留空 = 用 CallbackBind:CallbackPort 拼回调地址）
+      - TW2A_PUBLIC_BASE_URL=${TW2A_PUBLIC_BASE_URL:-}
+      # /v1/* 允许的跨域来源（逗号分隔；留空 = "*"）
+      - TW2A_CORS_ORIGINS=${TW2A_CORS_ORIGINS:-}
+      # 其它可选覆盖项（留空则用镜像内 config.json）：
+      # - TW2A_MAX_IN_FLIGHT=2
+      # - TW2A_REQLOG_RETAIN_DAYS=3
+      # - TW2A_STREAM_THINKING=reasoning
+      # - TW2A_SCHEDULE_REFRESH_HOURS=3
+      # - TW2A_SCHEDULE_BALANCE_HOURS=8,12,18,23
     ports:
       - "${TW2A_PORT:-8000}:8000"
+      # 回调端口映射：仅路线 B（本机调试）需要；配了 TW2A_PUBLIC_BASE_URL 时可删。
+      # 宿主侧端口用 TW2A_CALLBACK_PUBLISH 覆盖，容器侧跟随 TW2A_CALLBACK_PORT
+      # （两者保持一致，否则映射与实际监听端口不匹配，回调必然不通）。
+      # 想彻底关掉回调 server：注释掉本行，再把 TW2A_CALLBACK_PORT 设为 0
+      # （端口设为 0 时这条映射会因 target 为空而报错，所以必须先注释）。
+      - "${TW2A_CALLBACK_PUBLISH:-18080}:${TW2A_CALLBACK_PORT:-18080}"
     volumes:
       # 账号凭证与运行态（state/usage/流水）持久化到宿主
       - ./auths:/app/auths
@@ -28,6 +63,7 @@ services:
     # 容器 stdout 日志轮转。docker 的 json-file 驱动只能按「大小+份数」限制，
     # 不支持按天，所以这里用「20MB × 3 份」近似三天量级：本服务 stdout 只有
     # 启动信息与少量错误，正常一天远达不到 20MB。
+    # （请求流水归档另由 reqlog.retain_days 按天清理，默认 3 天。）
     logging:
       driver: json-file
       options:

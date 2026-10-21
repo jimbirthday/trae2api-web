@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -151,8 +152,11 @@ func TestStreamErrorFrameIsOpenAI(t *testing.T) {
 		"event:error\ndata:{\"code\":1005,\"message\":\"quota exceeded\"}\n\n"
 	var sb strings.Builder
 	w := &sbWriter{b: &sb}
-	if err := StreamWithOptions(w, strings.NewReader(sse), StreamOptions{}); err != nil {
-		t.Fatal(err)
+	// 流内错误：客户端必须收到 OpenAI 的 error 帧（这里校验），
+	// 同时调用方拿到分类结果（用于冷却账号/换号）。
+	var se *SOLOStreamError
+	if err := StreamWithOptions(w, strings.NewReader(sse), StreamOptions{}); !errors.As(err, &se) {
+		t.Fatalf("want SOLOStreamError, got %v", err)
 	}
 	body := sb.String()
 	if strings.Contains(body, "event: error") {

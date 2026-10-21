@@ -104,6 +104,36 @@ func (c *Client) MatchModelError(status int, body string) (kind string, ok bool)
 	return "", false
 }
 
+// bizCodeFromBody 结构化取业务码：优先顶层 code，其次 error.code，再看
+// err_code/error_code/status。取不到（非 JSON / 无该字段）返回 ok=false。
+//
+// 为什么不继续用子串匹配：`"1005"` 这种子串会命中 message 里恰好出现的数字、
+// 也可能命中 11005 这类别的码。先解析 JSON 再比值才稳；只有整段 body 根本不是
+// JSON 时才退回 containsBizCode 的宽松判断。
+func bizCodeFromBody(body string) (int64, bool) {
+	if body == "" {
+		return 0, false
+	}
+	var raw map[string]any
+	if json.Unmarshal([]byte(body), &raw) != nil {
+		return 0, false
+	}
+	keys := []string{"code", "err_code", "error_code", "status", "status_code"}
+	for _, k := range keys {
+		if v, ok := numField(raw, k); ok {
+			return v, true
+		}
+	}
+	if e, ok := raw["error"].(map[string]any); ok {
+		for _, k := range keys {
+			if v, ok := numField(e, k); ok {
+				return v, true
+			}
+		}
+	}
+	return 0, false
+}
+
 // containsBizCode 判定 body 是否含业务码（JSON code 字段或独立数字 token）。
 func containsBizCode(body string, code int) bool {
 	s := strconv.Itoa(code)
@@ -189,12 +219,30 @@ func parseRetryAfterValue(v string, now time.Time) (time.Duration, bool) {
 	return 0, false
 }
 
+// ErrStreamIdleTimeout 上游 SSE 在「帧间空闲」上限内一个字节都没吐。
+//
+// 为什么需要独立哨兵：这类中断既不是客户端取消（context.Canceled），也不是
+// 账号本身有问题（上游可能只是把自己的推理进程挂住了）。用独立哨兵才能让
+// 上层区分「别罚号」与「换号」，也避免 IsClientGone 误判。
+var ErrStreamIdleTimeout = errors.New("upstream stream idle timeout")
+
+// ErrEmptyCompletion 上游整条流里没有任何正文/思考/工具调用帧。
+//
+// 以前这种流会被聚合/转发成「成功但内容为空、finish_reason=stop」，
+// 客户端拿到空回复且无从重试。现在显式报错，交给上层换号重试。
+var ErrEmptyCompletion = errors.New("upstream returned empty completion")
+
+// ErrTruncatedStream 上游流有内容但缺少 done 收尾（连接被中途掐断）。
+// 上层据此判定「可换号重试」，而不是把半句回复当成功。
+var ErrTruncatedStream = errors.New("upstream stream truncated (no done event)")
+
 // IsUpstreamTimeout 判定是否为上游超时（含 url.Error 等包装）。
 func IsUpstreamTimeout(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) ||
+		errors.Is(err, ErrStreamIdleTimeout) {
 		return true
 	}
 	var ne net.Error
