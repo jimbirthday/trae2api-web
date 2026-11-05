@@ -165,17 +165,27 @@ func (c *Client) agentBase() string { return c.AgentHost }
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
 
-// doJSON 发请求并解 JSON；HTTP 非 2xx 时返回带 body 片段的 *Error。
+// doJSON 发请求并校验 JSON；HTTP 或业务失败均返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("upstream response read: %w", err)
+	}
+	code, hasCode := bizCodeFromBody(string(raw))
+	if resp.StatusCode >= 300 || (hasCode && code != 0) {
 		kind := Classify(resp.StatusCode, string(raw))
+		if kind == ErrNone {
+			kind = ErrClient
+		}
 		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+	}
+	if !json.Valid(raw) {
+		return nil, fmt.Errorf("upstream returned invalid JSON (http %d)", resp.StatusCode)
 	}
 	return raw, nil
 }
@@ -213,19 +223,26 @@ func (c *Client) refreshLocked(a *auth.Auth) error {
 	if host == "" {
 		host = c.oauthBase()
 	}
-	body := map[string]any{
-		"ClientID":     c.ClientID,
-		"RefreshToken": a.RefreshToken, // 已持 a 写锁，直接读
-		"ClientSecret": "-",
-		"UserID":       "",
+	exchange := func(clientID string) (json.RawMessage, error) {
+		body := map[string]any{
+			"ClientID":     clientID,
+			"RefreshToken": a.RefreshToken, // 已持 a 写锁，直接读
+			"ClientSecret": "-",
+			"UserID":       "",
+		}
+		raw, _ := json.Marshal(body)
+		req, err := http.NewRequest(http.MethodPost, host+EpExchange, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		OAuthHeaders(req)
+		return c.doJSON(req)
 	}
-	raw, _ := json.Marshal(body)
-	req, err := http.NewRequest(http.MethodPost, host+EpExchange, bytes.NewReader(raw))
-	if err != nil {
-		return err
+	data, err := exchange(c.ClientID)
+	// IDE 导出的 refreshToken 绑定 IDE client，仅在明确不匹配时回退，避免重试失效凭据。
+	if err != nil && c.ClientID == ClientID && strings.Contains(err.Error(), "refresh token is not matched to the client") {
+		data, err = exchange(IDEClientID)
 	}
-	OAuthHeaders(req)
-	data, err := c.doJSON(req)
 	if err != nil {
 		return err
 	}
@@ -471,8 +488,20 @@ func (c *Client) CheckinClaim(a *auth.Auth) error {
 		return err
 	}
 	UgHeaders(req, a)
-	_, err = c.doJSON(req)
-	return err
+	data, err := c.doJSON(req)
+	if err != nil {
+		return err
+	}
+	var resp struct {
+		Code *int `json:"code"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("checkin claim parse: %w", err)
+	}
+	if resp.Code == nil {
+		return fmt.Errorf("checkin claim response missing code")
+	}
+	return nil
 }
 
 // UserEntUsage 聚合积分（ide_user_ent_usage 的 credits_limit 求和）。

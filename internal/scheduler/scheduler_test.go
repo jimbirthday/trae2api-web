@@ -47,6 +47,7 @@ type fakeUpstream struct {
 	claimCalls     atomic.Int32
 	refreshCalls   atomic.Int32
 	resourceRemain int64
+	claimCode      int64
 }
 
 func (f *fakeUpstream) server() *httptest.Server {
@@ -57,7 +58,7 @@ func (f *fakeUpstream) server() *httptest.Server {
 			w.Write([]byte(`{"checked_in":false,"credits":200,"enable":true}`))
 		case strings.HasSuffix(r.URL.Path, "/checkin_credits/claim"):
 			f.claimCalls.Add(1)
-			w.Write([]byte(`{"code":0,"message":"success"}`))
+			w.Write([]byte(`{"code":` + jsonI64(f.claimCode) + `,"message":"checkin result"}`))
 		case strings.HasSuffix(r.URL.Path, "/ide_user_ent_usage"):
 			w.Write([]byte(`{"is_credits_billing":true,"user_entitlement_pack_list":[{"entitlement_base_info":{"quota":{"credits_limit":` +
 				jsonI64(f.resourceRemain) + `}}}]}`))
@@ -132,6 +133,19 @@ func TestRunCheckinSkipsDisabled(t *testing.T) {
 	s.RunCheckinNow()
 	if f.checkinCalls.Load() != 0 {
 		t.Errorf("disabled account should be skipped, calls=%d", f.checkinCalls.Load())
+	}
+}
+
+func TestRunCheckinDoesNotRecordFailedClaim(t *testing.T) {
+	f := &fakeUpstream{claimCode: 9074}
+	srv := f.server()
+	defer srv.Close()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	s := newTestScheduler(f, p, srv)
+	s.RunCheckinNow()
+	if f.claimCalls.Load() != 1 || p.CheckinDoneToday("u1") {
+		t.Fatal("failed claim must run once without recording a successful checkin")
 	}
 }
 

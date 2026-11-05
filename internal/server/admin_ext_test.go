@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,7 +11,54 @@ import (
 	"testing"
 
 	"trae2api-web/internal/auth"
+	"trae2api-web/internal/upstream"
 )
+
+func TestCheckinAllReportsBusinessFailure(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	up := upstream.New()
+	up.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body := `{"user_entitlement_pack_list":[]}`
+		switch r.URL.Path {
+		case upstream.EpCheckinStatus:
+			body = `{"code":0,"checked_in":false,"enable":true,"credits":100}`
+		case upstream.EpCheckinClaim:
+			body = `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})}
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/admin/api/checkin_all", nil))
+	var out struct {
+		Accounts []struct {
+			Checked bool   `json:"checked_in"`
+			Error   string `json:"error"`
+		} `json:"accounts"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if rec.Code != 200 || len(out.Accounts) != 1 || out.Accounts[0].Checked || !strings.Contains(out.Accounts[0].Error, "9074") {
+		t.Fatalf("unexpected checkin result: %s", rec.Body)
+	}
+	if p.CheckinDoneToday("u1") {
+		t.Fatal("failed claim was recorded as checked in")
+	}
+}
+
+func TestCreditsDoesNotTrustOldLocalCheckin(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	p.NoteCheckinDone("u1")
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, `{"code":0,"checked_in":false,"enable":true,"credits":100}`, false
+	})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rows := h.fetchCredits()
+	if len(rows) != 1 || rows[0].Error != "" || rows[0].CheckedIn {
+		t.Fatalf("upstream says unchecked, but credits show %+v", rows)
+	}
+}
 
 // 导出含明文 token，必须带 Bearer；缺 key 一律 401。
 func TestExportRequiresBearer(t *testing.T) {

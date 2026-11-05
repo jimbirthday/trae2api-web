@@ -2,6 +2,8 @@
 package upstream
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"net/http"
 
 	"trae2api-web/internal/auth"
@@ -53,6 +55,10 @@ func UgHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("X-User-Region", "CN")
 	if a.DeviceID != "" {
 		req.Header.Set("X-Device-Id", a.DeviceID)
+	} else if a.UID != "" {
+		// 浏览器导出可能缺设备 ID；签到要求非空，按账号生成固定值避免每次变化。
+		id := sha256.Sum256([]byte("trae2api-web:" + a.UID))
+		req.Header.Set("X-Device-Id", fmt.Sprintf("%x", id[:16]))
 	}
 }
 

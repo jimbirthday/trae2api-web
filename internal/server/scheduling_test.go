@@ -374,7 +374,7 @@ func TestAdminPageHasSchedulingViews(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest("GET", "/admin", nil))
 	body := rec.Body.String()
 	for _, want := range []string{
-		"请求流水", "全部签到", "/admin/api/requests", "pauseAcct", "editProfile", "balanceAcct",
+		"请求记录", "签到领积分", "/admin/api/requests", "pauseAcct", "editProfile", "runBulk",
 		"max_in_flight", "cool_kind",
 	} {
 		if !strings.Contains(body, want) {

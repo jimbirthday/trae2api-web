@@ -192,9 +192,7 @@ func (h *Handler) fetchCredits() []creditRow {
 				}
 				ac.Error += "checkin: " + redactUpstream(sanitizeErrMsg(cerr.Error()))
 			} else {
-				// 本地按天记录的签到状态一并纳入：上游偶尔不回 checked_in，
-				// 本地日期戳能保证「今天签过」的号不会一直显示未签到。
-				ac.CheckedIn = checkedIn || h.cfg.Pool.CheckinDoneToday(s.UID)
+				ac.CheckedIn = checkedIn
 				ac.CheckinCredits, ac.CheckinEnable = credits, enable
 			}
 			out[i] = ac

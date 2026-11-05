@@ -3,276 +3,249 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>trae2api-web 控制台</title>
+<title>trae2api · 控制台</title>
 <style>
-  :root { --bg:#0f1115; --card:#171a21; --card2:#1d212b; --fg:#e6e9ef; --dim:#8a93a6;
-          --ok:#3fb96b; --warn:#e0a33e; --bad:#e05d5d; --accent:#4d9fff; }
+  :root { color-scheme:dark; --bg:#0c1110; --card:#131b18; --card2:#1b2521; --fg:#edf4f0; --dim:#9baba3; --line:#293630; --ok:#73dbab; --warn:#edc275; --bad:#f28c87; --accent:#73dbab; }
   * { margin:0; padding:0; box-sizing:border-box; }
-  body { background:var(--bg); color:var(--fg); font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif; min-height:100vh; }
-  .wrap { max-width:1100px; margin:0 auto; padding:28px 20px 60px; }
-  header { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; margin-bottom:18px; }
-  h1 { font-size:22px; font-weight:600; letter-spacing:.3px; }
-  h1 small { color:var(--dim); font-weight:400; font-size:13px; margin-left:8px; }
-  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-  .btn { background:var(--card2); color:var(--fg); border:1px solid #2a2f3a; border-radius:8px;
-         padding:8px 16px; font-size:13px; cursor:pointer; transition:.15s; }
-  .btn:hover { border-color:var(--accent); color:var(--accent); }
-  .btn.primary { background:#1c3a5a; border-color:var(--accent); color:var(--accent); }
-  .btn.danger { border-color:#5a2a2a; }
-  .btn.danger:hover { color:var(--bad); border-color:var(--bad); }
-  .btn.sm { padding:4px 10px; font-size:12px; }
-  #ts { color:var(--dim); font-size:12px; }
-  /* tabs */
-  .tabs { display:flex; gap:6px; margin-bottom:18px; border-bottom:1px solid #232836; }
-  .tab { padding:8px 16px; font-size:13px; cursor:pointer; color:var(--dim); border-bottom:2px solid transparent; }
-  .tab.active { color:var(--fg); border-bottom-color:var(--accent); }
+  body { background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",sans-serif; min-height:100vh; }
+  button,input,textarea,select { font:inherit; }
+  button,summary,select,input[type=checkbox] { cursor:pointer; }
+  button,input,textarea,select,summary { touch-action:manipulation; }
+  :focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  button:disabled,select:disabled,input:disabled { cursor:not-allowed; opacity:.45; }
+  [hidden] { display:none !important; }
+  .wrap { max-width:1440px; margin:0 auto; padding:0 36px 48px; }
+  header { display:flex; align-items:center; gap:28px; min-height:94px; border-bottom:1px solid var(--line); margin-bottom:30px; }
+  .brand { display:flex; align-items:center; gap:11px; flex-shrink:0; }
+  .brand-mark { width:34px; height:34px; display:grid; place-items:center; background:var(--accent); color:var(--bg); border-radius:9px; font:700 20px/1 monospace; }
+  h1 { font-size:20px; font-weight:650; letter-spacing:-.7px; }
+  h1 small { font-size:12px; color:var(--dim); font-weight:400; margin-left:10px; letter-spacing:0; }
+  h2 { font-size:23px; font-weight:600; letter-spacing:-.5px; }
+  h3 { font-size:16px; font-weight:600; }
+  .tabs { display:flex; gap:5px; flex:1; }
+  .tab { padding:10px 13px; border:0; border-radius:8px; font-size:13px; background:none; color:var(--dim); white-space:nowrap; }
+  .tab:hover { color:var(--fg); background:var(--card); }
+  .tab.active { color:var(--accent); background:#1b3026; }
   .pane { display:none; }
   .pane.active { display:block; }
-  /* key bar */
-  .keybar { display:flex; gap:8px; align-items:center; margin-bottom:14px; font-size:12px; color:var(--dim); flex-wrap:wrap; }
-  .keybar input { background:var(--card); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
-                  padding:5px 10px; font-size:12px; width:200px; font-family:Consolas,monospace; }
-  .keybar .saved { color:var(--ok); font-size:11px; }
-  /* credits grid */
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
-  .card { background:var(--card); border:1px solid #232836; border-radius:12px; padding:18px 18px 14px; }
-  .card.err { border-color:var(--bad); }
-  .card-top { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
-  .nick { font-size:15px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .uid { color:var(--dim); font-size:11px; margin-top:2px; font-family:Consolas,monospace; }
-  .badges { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
-  .badge { font-size:11px; padding:3px 9px; border-radius:99px; white-space:nowrap; }
-  .b-ok   { background:#173a26; color:var(--ok); }
-  .b-warn { background:#3a2d13; color:var(--warn); }
-  .b-bad  { background:#3a1717; color:var(--bad); }
-  .b-dim  { background:#22262f; color:var(--dim); }
-  .credits { margin:16px 0 14px; display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
-  .remain { font-size:34px; font-weight:700; font-variant-numeric:tabular-nums; }
-  .remain span { font-size:14px; color:var(--dim); font-weight:400; margin-left:4px; }
-  .meta { color:var(--dim); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; }
-  .meta b { color:var(--fg); font-weight:600; }
-  .errline { margin-top:10px; color:var(--bad); font-size:12px; word-break:break-all; }
-  /* accounts table */
+  .toolbar,.section-actions,.imp-row,.row-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .toolbar { margin-left:auto; flex-wrap:nowrap; }
+  .btn,.pgbtn { background:var(--card2); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:9px 14px; font-size:13px; cursor:pointer; transition:background .15s,border-color .15s; white-space:nowrap; }
+  .btn:hover:not(:disabled),.pgbtn:hover:not(:disabled) { border-color:#577664; background:#23332a; }
+  .btn.primary { background:var(--accent); color:#102219; border-color:var(--accent); font-weight:600; }
+  .btn.primary:hover:not(:disabled) { background:#8de8be; }
+  .btn.ghost { background:transparent; }
+  .btn.danger { color:var(--bad); }
+  .btn.sm { padding:6px 10px; font-size:12px; }
+  .btn.link { background:none; border:0; color:var(--dim); padding:6px; }
+  #ts { color:var(--dim); font-size:11px; white-space:nowrap; }
+  .connection { position:relative; }
+  .connection summary { list-style:none; }
+  .connection summary::-webkit-details-marker { display:none; }
+  .keybar { position:absolute; top:46px; right:0; z-index:20; width:310px; display:grid; gap:12px; padding:20px; border:1px solid var(--line); border-radius:12px; background:var(--card); box-shadow:0 16px 50px #0006; }
+  .keybar label,.keybar .saved { color:var(--dim); font-size:12px; }
+  .keybar .saved { color:var(--ok); }
+  input.imp,textarea.imp,select.imp,.keybar input[type=password] { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:8px; padding:9px 12px; font-size:13px; min-width:0; }
+  .keybar input[type=password] { width:100%; }
+  .key-options { display:flex; gap:8px; align-items:center; }
+  .section-head { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:22px; flex-wrap:wrap; }
+  .section-title { display:flex; align-items:baseline; gap:12px; }
+  .muted { color:var(--dim); font-size:12px; }
+  .summary-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:16px; margin-bottom:24px; }
+  .summary-card { padding:20px 22px; background:var(--card); border:1px solid var(--line); border-radius:12px; }
+  .summary-label { display:flex; align-items:center; gap:7px; color:var(--dim); font-size:12px; }
+  .summary-dot { width:6px; height:6px; border-radius:50%; background:var(--dim); }
+  .summary-value { font-size:30px; font-weight:600; margin-top:12px; font-variant-numeric:tabular-nums; letter-spacing:-.8px; }
+  .summary-card.available .summary-dot { background:var(--ok); }
+  .summary-card.attention .summary-dot { background:var(--warn); }
+  .summary-card.available .summary-value { color:var(--ok); }
+  .account-panel { background:var(--card); border:1px solid var(--line); border-radius:12px; }
+  .filterbar { display:flex; align-items:center; gap:10px; padding:18px 20px; flex-wrap:wrap; }
+  .search { flex:1; max-width:360px; min-width:160px; }
+  .filterbar .imp { background:var(--bg); }
+  .batchbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:12px 20px; background:#16201b; border-top:1px solid var(--line); border-bottom:1px solid var(--line); }
+  #selectionCount { min-width:100px; font-size:12px; font-weight:500; }
+  .batch-controls { margin-left:auto; display:flex; gap:8px; align-items:center; }
+  .batch-controls select { min-width:136px; }
+  .table-scroll { overflow-x:auto; }
   table.accts { width:100%; border-collapse:collapse; font-size:13px; }
-  table.accts th, table.accts td { text-align:left; padding:10px 12px; border-bottom:1px solid #232836; }
-  table.accts th { color:var(--dim); font-weight:500; font-size:12px; }
-  table.accts tr:hover td { background:var(--card2); }
-  table.accts .mono { font-family:Consolas,monospace; font-size:11px; color:var(--dim); }
-  .row-actions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
-  .toggle { position:relative; display:inline-block; width:38px; height:20px; }
-  .toggle input { opacity:0; width:0; height:0; }
-  .toggle .slider { position:absolute; cursor:pointer; inset:0; background:#2a2f3a; border-radius:99px; transition:.15s; }
-  .toggle .slider:before { content:""; position:absolute; height:14px; width:14px; left:3px; top:3px; background:var(--dim); border-radius:50%; transition:.15s; }
-  .toggle input:checked + .slider { background:#1c3a5a; }
-  .toggle input:checked + .slider:before { transform:translateX(18px); background:var(--accent); }
-  /* login + import */
-  .login-bar { background:var(--card); border:1px solid #232836; border-radius:12px; padding:16px 18px; margin-bottom:18px; }
-  .login-bar h2 { font-size:14px; font-weight:600; margin-bottom:10px; }
-  .login-status { font-size:12px; color:var(--dim); margin-top:8px; word-break:break-all; }
+  table.accts th,table.accts td { text-align:left; padding:16px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  table.accts th { color:var(--dim); font-weight:400; font-size:12px; background:#111914; white-space:nowrap; }
+  table.accts tr:last-child td { border-bottom:0; }
+  table.accts tr:hover td { background:#19241e; }
+  table.accts tr.selected td { background:#1b3026; }
+  #acctTable table { min-width:880px; }
+  .check-cell { width:48px; padding-right:0 !important; }
+  input[type=checkbox] { width:16px; height:16px; accent-color:var(--accent); vertical-align:middle; }
+  .nick { font-size:13px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:240px; }
+  .uid,.mono { font:12px/1.6 ui-monospace,SFMono-Regular,Consolas,monospace; color:var(--dim); }
+  .uid { margin-top:3px; }
+  .account-note { color:var(--dim); font-size:12px; margin-top:4px; max-width:230px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .state-stack { display:flex; align-items:center; gap:5px; flex-wrap:wrap; max-width:180px; }
+  .badge { display:inline-block; font-size:11px; padding:3px 8px; border-radius:5px; white-space:nowrap; }
+  .b-ok { background:#1c3528; color:var(--ok); }
+  .b-warn { background:#362e1e; color:var(--warn); }
+  .b-bad { background:#382522; color:var(--bad); }
+  .b-dim { background:#26312b; color:var(--dim); }
+  .credit-value { font-size:15px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .credit-track { height:3px; width:100px; background:var(--line); border-radius:4px; margin-top:7px; overflow:hidden; }
+  .credit-track span { display:block; height:100%; background:var(--accent); }
+  .row-actions { justify-content:flex-end; flex-wrap:nowrap; }
+  .row-menu { max-width:115px; padding:6px !important; font-size:12px !important; background:var(--card2) !important; }
+  .toggle { position:relative; display:inline-block; width:32px; height:24px; flex-shrink:0; }
+  .toggle input { position:absolute; width:32px; height:24px; opacity:0; }
+  .toggle .slider { position:absolute; pointer-events:none; inset:4px 0; background:#3c4941; border-radius:99px; transition:.15s; }
+  .toggle .slider:before { content:""; position:absolute; height:12px; width:12px; left:2px; top:2px; background:#c0cdc4; border-radius:50%; transition:.15s; }
+  .toggle input:checked + .slider { background:#326a4a; }
+  .toggle input:checked + .slider:before { transform:translateX(16px); background:var(--accent); }
+  .toggle input:focus-visible + .slider { outline:2px solid var(--accent); outline-offset:3px; }
+  .pager { display:flex; gap:6px; align-items:center; flex-wrap:wrap; padding:16px 20px; font-size:12px; color:var(--dim); }
+  .pgbtn { padding:5px 10px; font-size:12px; }
+  .pgbtn.on { color:var(--accent); border-color:#417055; background:#1b3026; }
+  .pager select { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:4px 6px; }
+  .login-status { font-size:12px; color:var(--dim); white-space:pre-wrap; overflow-wrap:anywhere; }
   .login-status.err { color:var(--bad); }
   .login-status.ok { color:var(--ok); }
-  textarea.imp { width:100%; min-height:90px; background:var(--card); border:1px solid #2a2f3a;
-                 border-radius:8px; color:var(--fg); padding:10px 12px; font-size:12px;
-                 font-family:Consolas,monospace; resize:vertical; }
-  .imp-row { display:flex; gap:10px; align-items:flex-start; margin-top:8px; flex-wrap:wrap; }
-  /* 分页器 */
-  .pager { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:14px 0 6px; font-size:12px; color:var(--dim); }
-  .pgbtn { background:var(--card2); border:1px solid #2a2f3a; color:var(--fg); border-radius:6px;
-           padding:4px 10px; font-size:12px; cursor:pointer; transition:.15s; font-family:inherit; }
-  .pgbtn:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
-  .pgbtn:disabled { opacity:.35; cursor:not-allowed; }
-  .pgbtn.on { background:#1c3a5a; border-color:var(--accent); color:var(--accent); }
-  .pager select { background:var(--card); border:1px solid #2a2f3a; border-radius:6px; color:var(--fg);
-                  padding:3px 6px; font-size:12px; font-family:inherit; }
-  select.imp { min-height:auto; background:var(--card); border:1px solid #2a2f3a; border-radius:8px;
-               color:var(--fg); padding:7px 10px; font-size:12px; font-family:inherit; }
-  /* modal */
-  .modal-bg { position:fixed; inset:0; background:rgba(0,0,0,.6); display:none; align-items:center; justify-content:center; z-index:100; }
-  .modal-bg.show { display:flex; }
-  .modal { background:var(--card); border:1px solid #2a2f3a; border-radius:12px; padding:20px; max-width:560px; width:92%; max-height:80vh; overflow:auto; }
-  .modal h3 { font-size:15px; margin-bottom:12px; }
-  .modal pre { background:var(--bg); border:1px solid #232836; border-radius:8px; padding:12px; font-size:12px;
-              font-family:Consolas,monospace; overflow:auto; white-space:pre-wrap; word-break:break-all; color:var(--fg); }
-  .modal .close { margin-top:14px; }
-  .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--card2); border-top-color:var(--accent);
-          border-radius:50%; animation:sp .8s linear infinite; vertical-align:-2px; }
+  #loginStatus { margin-bottom:16px; }
+  .batch-feedback { padding:0 20px; }
+  #bulkStatus { padding:12px 0; max-height:190px; overflow:auto; }
+  #bulkProgress { width:100%; height:4px; accent-color:var(--accent); margin-bottom:12px; }
+  .empty { text-align:center; padding:60px 20px; color:var(--dim); }
+  .login-bar,.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  .login-bar h2,.card h2 { font-size:15px; margin-bottom:12px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:16px; }
+  .card { margin:0; }
+  .card.err { border-color:#88514a; }
+  .card-top { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
+  .badges { display:flex; gap:5px; flex-wrap:wrap; justify-content:flex-end; }
+  .remain { font-size:32px; font-weight:600; margin:20px 0 12px; font-variant-numeric:tabular-nums; }
+  .remain span { font-size:12px; color:var(--dim); font-weight:400; margin-left:7px; }
+  .meta { color:var(--dim); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; }
+  .meta b { color:var(--fg); font-weight:500; }
+  .errline { margin-top:12px; color:var(--bad); font-size:12px; overflow-wrap:anywhere; }
+  #reqTable,#usageTable { overflow-x:auto; background:var(--card); border:1px solid var(--line); border-radius:12px; }
+  #reqTable table,#usageTable table { min-width:1000px; }
+  dialog.modal { position:fixed; inset:0; margin:auto; background:var(--card); color:var(--fg); border:1px solid var(--line); border-radius:14px; padding:24px; width:min(560px,calc(100% - 32px)); max-height:85dvh; overflow:auto; box-shadow:0 30px 100px #0008; }
+  dialog::backdrop { background:#000a; backdrop-filter:blur(3px); }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:20px; }
+  .modal pre { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:12px; font:12px/1.7 ui-monospace,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .modal label { display:block; color:var(--dim); font-size:12px; margin:18px 0 8px; }
+  textarea.imp { width:100%; min-height:135px; resize:vertical; font-family:ui-monospace,Consolas,monospace; }
+  .modal .imp-row { margin-top:14px; }
+  .modal .login-status { margin-top:12px; }
+  .spin { display:inline-block; width:12px; height:12px; border:2px solid var(--line); border-top-color:var(--accent); border-radius:50%; animation:sp .8s linear infinite; }
   @keyframes sp { to { transform:rotate(360deg); } }
+  @media(max-width:1050px) { .wrap { padding:0 22px 36px; } header { gap:16px; flex-wrap:wrap; padding:20px 0; } .tabs { order:3; flex-basis:100%; } #ts { display:none; } .summary-card { padding:17px; } }
+  @media(max-width:600px) { .wrap { padding:0 14px 24px; } header { margin-bottom:22px; } h1 small { display:none; } h2 { font-size:21px; } .toolbar { gap:5px; } .toolbar .btn { padding:8px 10px; } .tabs { gap:0; justify-content:space-between; } .tab { flex:1; padding:10px 6px; } .summary-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-bottom:18px; } .summary-value { font-size:26px; margin-top:8px; } .section-head { gap:12px; margin-bottom:18px; } .filterbar,.batchbar { padding:14px; } .search { max-width:none; } .filterbar select { width:125px; } .batch-controls { margin-left:0; flex-basis:100%; } .batch-controls select { flex:1; } .pager { padding:14px; gap:5px; } .keybar { width:280px; } .imp,input.imp,textarea.imp,.keybar input[type=password] { font-size:16px; } .row-menu { font-size:12px !important; } .grid { grid-template-columns:1fr; } .section-actions .btn { padding:9px 12px; } }
+  @media(prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>trae2api-web 控制台<small>凭证管理 · 额度监控</small></h1>
+    <div class="brand"><span class="brand-mark" aria-hidden="true">/</span><h1>trae2api<small>控制台</small></h1></div>
+    <nav class="tabs" aria-label="主导航">
+      <button class="tab active" aria-current="page" onclick="switchTab('accounts',this)">账号管理</button>
+      <button class="tab" onclick="switchTab('credits',this)">额度监控</button>
+      <button class="tab" onclick="switchTab('requests',this)">请求记录</button>
+      <button class="tab" onclick="switchTab('usage',this)">用量统计</button>
+    </nav>
     <div class="toolbar">
       <span id="ts"></span>
-      <button class="btn" onclick="refreshActive(true)">刷新</button>
+      <button class="btn ghost" onclick="refreshActive(true)">刷新</button>
+      <details class="connection"><summary class="btn ghost">连接设置</summary>
+        <div class="keybar">
+          <label for="apikey">API Key</label>
+          <input id="apikey" type="password" placeholder="输入 API Key" oninput="onKeyChange()" autocomplete="off">
+          <label class="key-options"><input type="checkbox" id="rememberKey"> 在此浏览器记住密钥</label>
+          <div class="imp-row"><button class="btn primary sm" onclick="saveKey()">应用</button><span id="keystatus" class="saved" style="display:none">已应用</span><button class="btn sm ghost" onclick="logout()">退出登录</button></div>
+        </div>
+      </details>
     </div>
   </header>
 
-  <div class="keybar">
-    <span>API Key：</span>
-    <input id="apikey" type="password" placeholder="TW2A_API_KEY（会话失效后需重新填写）" oninput="onKeyChange()">
-    <button class="btn sm" onclick="saveKey()">应用</button>
-    <label style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--dim);cursor:pointer">
-      <input type="checkbox" id="rememberKey" style="width:auto;margin:0"> 记住（存本地）
-    </label>
-    <span id="keystatus" class="saved" style="display:none">已应用</span>
-    <button class="btn sm" onclick="logout()">退出登录</button>
-    <span style="margin-left:auto;font-size:11px">面板与全部接口均需鉴权</span>
-  </div>
+  <main>
+    <section id="pane-accounts" class="pane active" aria-labelledby="accountsTitle">
+      <div class="section-head">
+        <div class="section-title"><h2 id="accountsTitle">账号管理</h2><span id="acctMeta" class="muted"></span></div>
+        <div class="section-actions">
+          <button class="btn ghost" onclick="document.getElementById('importDialog').showModal()">导入账号</button>
+          <button class="btn primary" id="loginBtn" onclick="startLogin()">＋ 添加账号</button>
+        </div>
+      </div>
+      <div id="loginStatus" class="login-status" role="status" style="display:none"></div>
+      <div class="summary-grid" aria-label="账号概览">
+        <div class="summary-card"><div class="summary-label"><span class="summary-dot"></span>账号总数</div><div class="summary-value" id="statTotal">—</div></div>
+        <div class="summary-card available"><div class="summary-label"><span class="summary-dot"></span>可用账号</div><div class="summary-value" id="statAvailable">—</div></div>
+        <div class="summary-card attention"><div class="summary-label"><span class="summary-dot"></span>需处理</div><div class="summary-value" id="statAttention">—</div></div>
+        <div class="summary-card"><div class="summary-label"><span class="summary-dot"></span>剩余积分</div><div class="summary-value" id="statCredits">—</div></div>
+      </div>
+      <div class="account-panel">
+        <div class="filterbar">
+          <input class="imp search" id="acctQ" aria-label="搜索账号" placeholder="搜索账号、昵称或备注" oninput="acctFilterChanged()">
+          <select class="imp" id="acctStatus" aria-label="账号状态" onchange="acctFilterChanged()">
+            <option value="">全部状态</option><option value="ok">正常</option><option value="cooling">冷却中</option><option value="paused">已暂停</option><option value="off">已停用</option><option value="disabled">登录失效</option>
+          </select>
+        </div>
+        <div class="batchbar">
+          <span id="selectionCount" role="status" aria-live="polite">未选择账号</span>
+          <button class="btn link" id="selectAllResults" onclick="selectAllAccounts()">全选筛选结果</button>
+          <button class="btn link" id="clearSelection" onclick="clearSelection()" disabled>清空</button>
+          <div class="batch-controls">
+            <select class="imp" id="bulkAction" aria-label="批量操作" disabled>
+              <option value="checkin">签到领积分</option><option value="balance">刷新额度</option><option value="refresh">刷新 Token</option><option value="test">测试连通性</option><option value="enable">启用账号</option><option value="disable">停用账号</option><option value="pause">暂停调度</option><option value="resume">恢复调度</option><option value="unfreeze">刷新额度并解冻</option><option value="revive">解除禁用</option><option value="export">导出凭证</option><option value="delete">删除账号</option>
+            </select>
+            <button class="btn sm" id="bulkRun" onclick="runBulk()" disabled>执行</button>
+          </div>
+        </div>
+        <div class="batch-feedback"><div id="bulkStatus" class="login-status" role="status" aria-live="polite" style="display:none"></div><progress id="bulkProgress" value="0" max="1" hidden aria-label="批量操作进度"></progress></div>
+        <div id="acctTable" class="table-scroll"><div class="empty"><span class="spin"></span> 加载中</div></div>
+        <div id="pgAccts" class="pager"></div>
+      </div>
+    </section>
 
-  <div class="tabs">
-    <div class="tab active" onclick="switchTab('accounts',this)">账号管理</div>
-    <div class="tab" onclick="switchTab('credits',this)">额度监控</div>
-    <div class="tab" onclick="switchTab('requests',this)">请求流水</div>
-    <div class="tab" onclick="switchTab('usage',this)">用量统计</div>
-  </div>
+    <section id="pane-requests" class="pane" aria-labelledby="requestsTitle">
+      <div class="section-head"><h2 id="requestsTitle">请求记录</h2></div>
+      <div class="login-bar"><div class="imp-row">
+        <input class="imp" id="fUid" aria-label="账号 UID" placeholder="账号 UID" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
+        <input class="imp" id="fModel" aria-label="模型名称" placeholder="模型名称" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
+        <select class="imp" id="fOutcome" aria-label="请求结果" onchange="reqState.page=1;loadRequests(true)"><option value="">全部结果</option><option value="success">成功</option><option value="http_error">请求失败</option><option value="stream_error">响应中断</option><option value="interrupted">客户端取消</option></select>
+        <button class="btn" onclick="loadRequests(true)">查询</button><button class="btn ghost" onclick="clearReqFilters()">重置</button>
+      </div><div id="metricsLine" class="login-status" style="display:none;margin-top:14px"></div></div>
+      <div id="reqTable"><div class="empty">暂无记录</div></div><div id="pgReqs" class="pager"></div>
+    </section>
 
-  <!-- 账号管理 -->
-  <div id="pane-accounts" class="pane active">
-    <div class="login-bar">
-      <h2>添加账号（TRAE 登录）</h2>
-      <button class="btn primary" id="loginBtn" onclick="startLogin()">添加账号（TRAE 登录）</button>
-      <div id="loginStatus" class="login-status" style="display:none"></div>
-    </div>
+    <section id="pane-usage" class="pane" aria-labelledby="usageTitle">
+      <div class="section-head"><h2 id="usageTitle">用量统计</h2><span id="usageMeta" class="login-status" style="display:none"></span></div>
+      <div class="grid" id="usageKpi" style="margin-bottom:18px"></div>
+      <div id="usageTable"><div class="empty">暂无用量</div></div><div id="pgUsage" class="pager"></div>
+      <p class="muted" style="margin:8px 0 24px">积分消耗为采样估算，暂无样本时显示「—」。</p>
+      <div class="card"><h3>模型别名</h3><label for="aliasBox" class="muted" style="display:block;margin:10px 0">每行一个映射，例如 gpt-4o=glm-5.2</label>
+        <textarea class="imp" id="aliasBox" rows="4" spellcheck="false" placeholder="gpt-4o=glm-5.2&#10;fast=kimi-k3"></textarea>
+        <div class="imp-row" style="margin-top:12px"><button class="btn primary" id="aliasSave">保存</button><button class="btn ghost" id="aliasReload">重载</button><span id="aliasStatus" class="login-status" style="display:none"></span></div>
+      </div>
+    </section>
 
-    <div class="login-bar">
-      <h2>导入凭证（文件 / 粘贴回调链接或 JSON）</h2>
-      <div class="imp-row" style="margin-top:0;margin-bottom:8px">
-        <input type="file" id="impFile" accept=".json,application/json" multiple onchange="importFiles(this)" style="font-size:12px">
-        <span style="font-size:11px;color:var(--dim)">支持 .json 文件：{"accounts":[{...}]}、[{...}]、单条 {name,token,refreshToken,cookies} 或 trae-cn-relay-accounts 导出包</span>
-      </div>
-      <textarea class="imp" id="impInput" placeholder="粘贴 http://127.0.0.1:8000/authorize?refreshToken=... 回调链接，或 {&quot;accounts&quot;:[{&quot;name&quot;:&quot;账号1&quot;,&quot;token&quot;:&quot;&lt;jwt&gt;&quot;,&quot;refreshToken&quot;:&quot;...&quot;}]} / {&quot;format&quot;:&quot;trae-cn-relay-accounts&quot;,&quot;accounts&quot;:[...]} / {&quot;account&quot;:...,&quot;auth&quot;:...} JSON"></textarea>
-      <div class="imp-row">
-        <button class="btn primary" onclick="importCred()">导入</button>
-        <button class="btn" onclick="exportCreds()">导出全部凭证</button>
-        <span id="impStatus" class="login-status" style="display:none"></span>
-      </div>
-    </div>
-
-    <div class="login-bar">
-      <h2>批量运维</h2>
-      <div class="imp-row">
-        <button class="btn" onclick="bulk('enable')">全部启用</button>
-        <button class="btn" onclick="bulk('disable')">全部停用</button>
-        <button class="btn" onclick="bulk('pause')">全部暂停选号</button>
-        <button class="btn" onclick="bulk('resume')">全部恢复选号</button>
-        <button class="btn primary" onclick="checkinAll()">全部签到 + 刷额度</button>
-        <span id="bulkStatus" class="login-status" style="display:none"></span>
-      </div>
-    </div>
-
-    <div class="login-bar">
-      <h2>账号列表</h2>
-      <div class="imp-row" style="margin-top:0">
-        <input class="imp" id="acctQ" placeholder="搜索 uid / 昵称 / 备注" style="min-height:auto;width:240px" oninput="acctFilterChanged()" onkeydown="if(event.key==='Enter'){acctFilterChanged()}">
-        <select class="imp" id="acctStatus" onchange="acctFilterChanged()">
-          <option value="">全部状态</option>
-          <option value="ok">正常</option>
-          <option value="cooling">冷却中</option>
-          <option value="paused">已暂停选号</option>
-          <option value="off">已停用</option>
-          <option value="disabled">禁用(session dead)</option>
-        </select>
-        <button class="btn" onclick="loadAccounts(true)">刷新列表</button>
-        <span id="acctMeta" style="font-size:12px;color:var(--dim)"></span>
-      </div>
-    </div>
-
-    <div id="acctTable"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
-    <div id="pgAccts" class="pager"></div>
-  </div>
-
-  <!-- 请求流水 -->
-  <div id="pane-requests" class="pane">
-    <div class="login-bar">
-      <h2>请求流水与指标</h2>
-      <div class="imp-row">
-        <input class="imp" style="min-height:auto;width:180px" id="fUid" placeholder="uid 过滤" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
-        <input class="imp" style="min-height:auto;width:180px" id="fModel" placeholder="model 过滤" onkeydown="if(event.key==='Enter'){reqState.page=1;loadRequests(true)}">
-        <select class="imp" style="min-height:auto;width:150px" id="fOutcome" onchange="reqState.page=1;loadRequests(true)">
-          <option value="">全部结果</option>
-          <option value="success">success（成功）</option>
-          <option value="http_error">http_error（HTTP 错误）</option>
-          <option value="stream_error">stream_error（流内错误）</option>
-          <option value="interrupted">interrupted（客户端中断）</option>
-        </select>
-        <button class="btn" onclick="loadRequests(true)">查询</button>
-        <button class="btn" onclick="clearReqFilters()">清空条件</button>
-      </div>
-      <div id="metricsLine" class="login-status" style="display:none"></div>
-    </div>
-    <div id="reqTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
-    <div id="pgReqs" class="pager"></div>
-  </div>
-
-  <!-- 用量统计 -->
-  <div id="pane-usage" class="pane">
-    <div class="login-bar">
-      <h2>按模型用量统计</h2>
-      <div class="imp-row">
-        <button class="btn" onclick="loadUsage()">刷新</button>
-        <span id="usageMeta" class="login-status" style="display:none"></span>
-      </div>
-      <div style="color:var(--dim);font-size:11px;margin-top:8px;line-height:1.7">
-        Token 与缓存率为<b>全量精确</b>（取自每个请求的 <code>token_usage</code> 事件）；
-        「积分/百万」为<b>窗口采样估算</b>——上游只提供账号级累计计数器且异步结算，
-        因此按「一个窗口内的积分增量 ÷ 同窗口 token 总量」计算，再按 token 比例分摊到模型，
-        取多次样本的中位数抗离群。样本数见末列，样本为 0（刚启动或窗口未满）时显示 "-"。<br>
-        <b>整体口径</b>：缓存率 = 全部模型 cache_read ÷ prompt（加权）；积分/百万 = 全部分摊积分 ÷ 全部 token（加权）；
-        <b>吞吐</b> = 累计 output token ÷ 累计「首帧→末帧」生成时长（加权，不是各请求的算术平均），旁边的小字是同一区间的字符速率——
-        若 token/s 正常而字/s 明显偏低，说明瓶颈在本端下发；反之则是上游生成慢。
-      </div>
-    </div>
-    <div class="grid" id="usageKpi" style="margin-bottom:14px"></div>
-    <div id="usageTable"><div style="color:var(--dim)">切换到本页后自动加载</div></div>
-    <div id="pgUsage" class="pager"></div>
-
-    <div class="card" style="margin-top:18px">
-      <h2>模型别名</h2>
-      <div style="color:var(--dim);font-size:11px;margin:6px 0 10px;line-height:1.7">
-        每行一条 <code>别名=真实模型</code>，例如 <code>gpt-4o=glm-5.2</code>。
-        只做<b>一级映射</b>（不递归），且若客户端传的名字本身就是真实模型 id 则不生效——
-        避免把显式指定的模型偷偷改掉。别名会出现在 <code>/v1/models</code> 里，客户端可直接选。
-      </div>
-      <textarea id="aliasBox" rows="6" spellcheck="false"
-        style="width:100%;background:var(--card2);color:var(--fg);border:1px solid #2a2f3a;border-radius:6px;
-               padding:9px 11px;font-family:Consolas,monospace;font-size:12px;resize:vertical"
-        placeholder="gpt-4o=glm-5.2&#10;fast=kimi-k3"></textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
-        <button class="btn primary" id="aliasSave">保存别名</button>
-        <button class="btn" id="aliasReload">重新载入</button>
-        <span id="aliasStatus" class="login-status" style="display:none"></span>
-      </div>
-    </div>
-  </div>
-
-  <!-- 额度监控 -->
-  <div id="pane-credits" class="pane">
-    <div class="login-bar">
-      <h2>额度与签到</h2>
-      <div class="imp-row" style="margin-top:0">
-        <button class="btn primary" onclick="loadCredits(true)">实时查询上游</button>
-        <span id="creditMeta" class="login-status" style="margin:0;display:none"></span>
-      </div>
-      <div style="color:var(--dim);font-size:11px;margin-top:8px;line-height:1.7">
-        每个账号每次刷新要请求上游 2 次（额度 + 签到），因此服务端缓存 <b>60 秒</b>：
-        切 tab、翻页都走缓存，只有点「实时查询上游」才会真正打上游。
-      </div>
-    </div>
-    <div class="grid" id="grid"><div style="color:var(--dim)"><span class="spin"></span> 加载中...</div></div>
-    <div id="pgCredits" class="pager"></div>
-  </div>
+    <section id="pane-credits" class="pane" aria-labelledby="creditsTitle">
+      <div class="section-head"><h2 id="creditsTitle">额度监控</h2><button class="btn" onclick="loadCredits(true)">查询最新额度</button></div>
+      <div id="creditMeta" class="login-status" style="display:none;margin-bottom:18px"></div>
+      <div class="grid" id="grid"><div class="empty"><span class="spin"></span> 加载中</div></div><div id="pgCredits" class="pager"></div>
+    </section>
+  </main>
 </div>
 
-<!-- JSON 预览 modal -->
-<div class="modal-bg" id="modalBg" onclick="if(event.target===this)closeModal()">
-  <div class="modal">
-    <h3 id="modalTitle">凭证预览（脱敏）</h3>
-    <pre id="modalBody"></pre>
-    <button class="btn sm close" onclick="closeModal()">关闭</button>
-  </div>
-</div>
+<dialog class="modal" id="importDialog" aria-labelledby="importTitle">
+  <div class="modal-head"><h3 id="importTitle">导入账号</h3><button class="btn sm ghost" onclick="document.getElementById('importDialog').close()">关闭</button></div>
+  <button class="btn" onclick="document.getElementById('impFile').click()">选择 JSON 文件</button>
+  <input type="file" id="impFile" accept=".json,application/json" multiple onchange="importFiles(this)" hidden>
+  <label for="impInput">或粘贴回调链接、账号 JSON</label>
+  <textarea class="imp" id="impInput" placeholder="粘贴登录回调链接或账号 JSON" spellcheck="false"></textarea>
+  <div class="imp-row"><button class="btn primary" onclick="importCred()">导入</button></div>
+  <div id="impStatus" class="login-status" role="status" style="display:none"></div>
+</dialog>
+<dialog class="modal" id="modalBg" aria-labelledby="modalTitle">
+  <div class="modal-head"><h3 id="modalTitle">凭证预览</h3><button class="btn sm ghost" onclick="closeModal()">关闭</button></div><pre id="modalBody"></pre>
+</dialog>
 
 <script>
 let activeTab = 'accounts';
@@ -391,7 +364,7 @@ function authHeader(){
 }
 function apiErr(d, fallback){
   if(d && d.error && d.error.code === 'invalid_api_key'){
-    return '需要有效 API Key：请在顶部「API Key」输入框填写 TW2A_API_KEY，点「记忆」后重试';
+    return '登录已失效，请在连接设置中更新 API Key';
   }
   return (d && (d.error?.message || d.message)) || fallback || '请求失败';
 }
@@ -438,8 +411,9 @@ async function logout(){
 function switchTab(name, el){
   if(activeTab && activeTab !== name) abortView(activeTab); // 作废上一个 tab 的在途请求
   activeTab = name;
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>{t.classList.remove('active');t.removeAttribute('aria-current');});
   el.classList.add('active');
+  el.setAttribute('aria-current','page');
   document.querySelectorAll('.pane').forEach(p=>p.classList.remove('active'));
   document.getElementById('pane-'+name).classList.add('active');
   refreshActive(false);
@@ -448,15 +422,26 @@ function refreshActive(force){
   if(activeTab==='accounts') loadAccounts(force);
   else if(activeTab==='credits') loadCredits(!!force); // 切 tab 走缓存，点刷新才打上游
   else if(activeTab==='usage'){ loadUsage(force); loadAliases(); }
-  else loadRequests(false);
+  else loadRequests(force);
 }
 
 /* ─── 账号管理 ─── */
-const acctState = { page:1, pageSize:20, total:0 };
+const acctState = { page:1, pageSize:20, total:0, visible:[] };
+const selectedAccounts = new Map();
 let acctFilterTimer = null;
+let bulkBusy = false;
+function accountQuery(page=acctState.page, pageSize=acctState.pageSize){
+  const q = new URLSearchParams({page, page_size:pageSize});
+  const keyword = document.getElementById('acctQ').value.trim();
+  const status = document.getElementById('acctStatus').value;
+  if(keyword) q.set('q', keyword);
+  if(status) q.set('status', status);
+  return q;
+}
 function acctFilterChanged(){
-  if(acctFilterTimer) clearTimeout(acctFilterTimer);
-  acctFilterTimer = setTimeout(()=>{ acctState.page = 1; loadAccounts(true); }, 250); // 输入防抖
+  clearSelection();
+  clearTimeout(acctFilterTimer);
+  acctFilterTimer = setTimeout(()=>{ acctState.page=1; loadAccounts(true); }, 250);
 }
 function gotoAccts(page, pageSize){
   if(pageSize) acctState.pageSize = Number(pageSize)||20;
@@ -464,110 +449,151 @@ function gotoAccts(page, pageSize){
   loadAccounts(true);
 }
 async function loadAccounts(force){
-  const q = new URLSearchParams();
-  q.set('page', acctState.page);
-  q.set('page_size', acctState.pageSize);
-  const kw = (document.getElementById('acctQ')||{}).value;
-  const stq = (document.getElementById('acctStatus')||{}).value;
-  if(kw && kw.trim()) q.set('q', kw.trim());
-  if(stq) q.set('status', stq);
   const el = document.getElementById('acctTable');
   try{
-    const d = await apiGet('/admin/api/accounts?'+q.toString(), 'accounts', 3000, force);
-    acctState.total = (d.total==null? (d.accounts||[]).length : d.total);
+    const d = await apiGet('/admin/api/accounts?'+accountQuery(), 'accounts', 3000, force);
+    acctState.total = d.total ?? (d.accounts||[]).length;
     acctState.page = d.page || acctState.page;
     acctState.pageSize = d.page_size || acctState.pageSize;
+    if(acctState.page>1 && acctState.page>Math.max(1,d.pages||1)){
+      acctState.page = Math.max(1,d.pages||1);
+      return loadAccounts(true);
+    }
     renderAccounts(d.accounts||[]);
-    const meta = document.getElementById('acctMeta');
-    if(meta) meta.textContent = '共 '+fmt(acctState.total)+' 个账号';
+    document.getElementById('acctMeta').textContent = fmt(acctState.total)+' 个账号';
+    const summary = d.summary||{};
+    for(const [id,key] of [['statTotal','total'],['statAvailable','available'],['statAttention','attention'],['statCredits','credits']]){
+      document.getElementById(id).textContent = fmt(summary[key] ?? 0);
+    }
     renderPager('pgAccts', acctState.page, acctState.pageSize, acctState.total, 'gotoAccts');
-    document.getElementById('ts').textContent = '更新于 ' + new Date().toLocaleTimeString();
+    document.getElementById('ts').textContent = new Date().toLocaleTimeString('zh-CN', {hour:'2-digit',minute:'2-digit'});
   }catch(e){
-    if(e.name === 'AbortError') return;
-    el.innerHTML = '<div style="color:var(--bad)">加载失败：'+esc(e.message)+'（服务是否在运行？）</div>';
+    if(e.name==='AbortError') return;
+    el.innerHTML = '<div class="empty" style="color:var(--bad)">加载失败：'+esc(e.message)+'</div>';
   }
 }
 function renderAccounts(accts){
+  acctState.visible = accts;
   const el = document.getElementById('acctTable');
   if(!accts.length){
-    const kw = (document.getElementById('acctQ')||{}).value || '';
-    const stq = (document.getElementById('acctStatus')||{}).value || '';
-    let msg;
-    if(kw.trim() || stq) msg = '没有符合条件的账号（清空上方搜索/状态过滤后重试）。';
-    else if(acctState.page > 1) msg = '当前页没有数据（页码超出范围）。';
-    else msg = '暂无账号，点上方「添加账号」登录，或粘贴回调链接导入。';
-    el.innerHTML = '<div style="color:var(--dim);padding:14px">'+msg+'</div>';
+    const filtered = document.getElementById('acctQ').value.trim() || document.getElementById('acctStatus').value;
+    el.innerHTML = '<div class="empty">'+(filtered?'没有匹配的账号':'暂无账号，添加或导入账号开始使用')+'</div>';
+    updateSelection();
     return;
   }
-  let rows = accts.map(a=>{
-    let badges = '';
-    if(a.disabled) badges += badge('禁用(session dead)','b-bad');
-    else if(!a.enabled) badges += badge('已停用','b-warn');
-    else if(a.paused) badges += badge('已暂停选号','b-dim');
-    else if(a.cooling) badges += badge('冷却'+(a.cool_kind?':'+a.cool_kind:''),'b-warn');
-    else badges += badge('正常','b-ok');
-    if(a.model_blocked && a.model_blocked.length) badges += badge(a.model_blocked.length+' 模型限额','b-dim');
-    if(a.expired_soon) badges += badge('token将过期','b-warn');
-    const exp = a.expires_at ? new Date(a.expires_at*1000).toLocaleString() : '-';
-    const toggleChecked = a.enabled && !a.disabled ? 'checked' : '';
-    const toggleDisabled = a.disabled ? 'disabled' : '';
-    return '<tr>'
-      + '<td><div class="nick">'+esc(a.nickname||'(未命名)')+'</div>'
-      + '<div class="uid mono">'+esc(a.uid)+'</div></td>'
-      + '<td>'+badges+(a.reason?'<div class="mono" style="margin-top:4px">'+esc(a.reason)+'</div>':'')+'</td>'
-      + '<td class="mono">'+fmt(a.credits)+(a.credits_total?' / '+fmt(a.credits_total):'')+'</td>'
-      + '<td class="mono">'+esc(exp)+'</td>'
-      + '<td class="mono">'+(a.in_flight||0)+' / '+(a.max_in_flight||0)+'</td>'
-      + '<td class="mono">'+esc(a.weight||1)+'</td>'
-      // UID 只进 data-uid 属性（HTML 转义），绝不拼进内联 onclick 的 JS 字符串：
-      // esc() 会把 ' 转成 &#39;，浏览器解析后仍是 '，可闭合字符串执行脚本（存储型 XSS）。
-      + '<td><div class="row-actions" data-uid="'+esc(a.uid)+'" data-paused="'+(a.paused?'1':'0')+'">'
-      + '<label class="toggle"><input type="checkbox" data-act="toggle" '+toggleChecked+' '+toggleDisabled+'><span class="slider"></span></label>'
-      + '<button class="btn sm" data-act="refresh">刷新token</button>'
-      + '<button class="btn sm" data-act="balance">刷额度</button>'
-      + (a.disabled ? '<button class="btn sm" data-act="revive">复活</button>' : '')
-      + '<button class="btn sm" data-act="pause">'+(a.paused?'恢复选号':'暂停选号')+'</button>'
-      + '<button class="btn sm" data-act="profile">权重/备注</button>'
-      + '<button class="btn sm" data-act="test">测试</button>'
-      + '<button class="btn sm" data-act="json">JSON</button>'
-      + '<button class="btn sm danger" data-act="delete">删除</button>'
-      + '</div></td>'
-      + '</tr>';
+  const rows = accts.map(a=>{
+    let state = a.disabled ? badge('登录失效','b-bad') : !a.enabled ? badge('已停用','b-dim')
+      : a.paused ? badge('已暂停','b-dim') : a.cooling ? badge('冷却中','b-warn') : badge('正常','b-ok');
+    if(a.model_blocked?.length) state += badge(a.model_blocked.length+' 模型限额','b-dim');
+    if(a.expired_soon) state += badge('即将过期','b-warn');
+    const date = a.expires_at ? new Date(a.expires_at*1000).toLocaleDateString('zh-CN') : '有效期未知';
+    const ratio = a.credits_total>0 ? Math.max(0,Math.min(100,a.credits/a.credits_total*100)) : 0;
+    return '<tr data-uid="'+esc(a.uid)+'" data-paused="'+(a.paused?'1':'0')+'">'
+      + '<td class="check-cell"><input type="checkbox" data-select="'+esc(a.uid)+'" aria-label="选择 '+esc(a.nickname||a.uid)+'"></td>'
+      + '<td><div class="nick">'+esc(a.nickname||'未命名账号')+'</div><div class="uid">'+esc(a.uid)+'</div>'
+        + (a.note?'<div class="account-note" title="'+esc(a.note)+'">'+esc(a.note)+'</div>':'')+'</td>'
+      + '<td><div class="state-stack" title="'+esc(a.reason||a.cool_kind||'')+'">'+state+'</div></td>'
+      + '<td><div class="credit-value">'+fmt(a.credits)+' <span class="muted">/ '+fmt(a.credits_total||0)+'</span></div>'
+        + '<div class="credit-track"><span style="width:'+ratio+'%"></span></div></td>'
+      + '<td><div class="mono">'+esc(date)+'</div><div class="muted">在途 '+(a.in_flight||0)+' / '+(a.max_in_flight||0)+' · 权重 '+esc(a.weight||1)+'</div></td>'
+      + '<td><div class="row-actions">'
+        + '<label class="toggle"><input type="checkbox" data-act="toggle" aria-label="启用 '+esc(a.nickname||a.uid)+'" data-locked="'+(a.disabled?'1':'0')+'" '+(a.enabled&&!a.disabled?'checked':'')+' '+(a.disabled?'disabled':'')+'><span class="slider"></span></label>'
+        + '<button class="btn sm ghost" data-act="checkin">签到</button>'
+        + '<select class="imp row-menu" data-act="menu" aria-label="'+esc(a.nickname||a.uid)+' 的更多操作">'
+          + '<option value="">更多操作</option><option value="refresh">刷新 Token</option><option value="balance">刷新额度</option>'
+          + '<option value="pause">'+(a.paused?'恢复调度':'暂停调度')+'</option><option value="unfreeze">刷新额度并解冻</option>'
+          + (a.disabled?'<option value="revive">解除禁用</option>':'')
+          + '<option value="profile">权重与备注</option><option value="test">测试连通性</option><option value="json">凭证预览</option><option value="delete">删除账号</option>'
+        + '</select></div></td></tr>';
   }).join('');
-  el.innerHTML = '<table class="accts"><thead><tr>'
-    + '<th>账号</th><th>状态</th><th>积分</th><th>Token 有效期</th><th>在途</th><th>权重</th><th style="text-align:right">操作</th>'
-    + '</tr></thead><tbody>'+rows+'</tbody></table>';
+  el.innerHTML = '<table class="accts"><thead><tr><th class="check-cell"><input type="checkbox" data-select-page aria-label="选择当前页"></th>'
+    + '<th>账号</th><th>状态</th><th>积分余额</th><th>Token 有效期</th><th style="text-align:right">操作</th></tr></thead><tbody>'+rows+'</tbody></table>';
+  updateSelection();
 }
-/* 账号行操作：事件委托。UID 从 closest('[data-uid]').dataset 读取，
-   任何动态数据都不进 JS 字符串字面量（防存储型 XSS）。 */
+function updateSelection(){
+  const n = selectedAccounts.size;
+  document.getElementById('selectionCount').textContent = n?'已选择 '+n+' 个账号':'未选择账号';
+  document.getElementById('bulkRun').disabled = bulkBusy || !n;
+  document.getElementById('bulkAction').disabled = bulkBusy || !n;
+  document.getElementById('clearSelection').disabled = bulkBusy || !n;
+  document.getElementById('selectAllResults').disabled = bulkBusy || !acctState.total;
+  document.getElementById('acctQ').disabled = bulkBusy;
+  document.getElementById('acctStatus').disabled = bulkBusy;
+  document.querySelectorAll('#acctTable [data-select]').forEach(input=>{
+    input.checked = selectedAccounts.has(input.dataset.select);
+    input.disabled = bulkBusy;
+    input.closest('tr').classList.toggle('selected',input.checked);
+  });
+  const all = document.querySelector('#acctTable [data-select-page]');
+  if(all){
+    const count = acctState.visible.filter(a=>selectedAccounts.has(a.uid)).length;
+    all.checked = count>0 && count===acctState.visible.length;
+    all.indeterminate = count>0 && count<acctState.visible.length;
+    all.disabled = bulkBusy;
+  }
+  document.querySelectorAll('#acctTable [data-act]').forEach(el=>{ el.disabled=bulkBusy || el.dataset.locked==='1'; });
+}
+function clearSelection(){
+  if(bulkBusy) return;
+  selectedAccounts.clear();
+  updateSelection();
+}
+async function selectAllAccounts(){
+  if(bulkBusy) return;
+  bulkBusy = true;
+  updateSelection();
+  const st = document.getElementById('bulkStatus');
+  st.style.display=''; st.className='login-status'; st.textContent='正在选择账号…';
+  try{
+    const accounts = new Map();
+    for(let page=1,pages=1; page<=pages; page++){
+      const d = await apiGet('/admin/api/accounts?'+accountQuery(page,200), null, 0, true);
+      pages = d.pages||1;
+      for(const a of d.accounts||[]) accounts.set(a.uid,{uid:a.uid,nickname:a.nickname});
+    }
+    selectedAccounts.clear();
+    for(const [uid,a] of accounts) selectedAccounts.set(uid,a);
+    st.textContent='已选择 '+selectedAccounts.size+' 个账号';
+  }catch(e){ st.className='login-status err'; st.textContent='选择失败：'+e.message; }
+  finally { bulkBusy=false; updateSelection(); }
+}
 function acctAct(e){
-  const el = e.target.closest ? e.target.closest('[data-act]') : null;
-  if(!el) return;
-  // 开关走 change（点击 checkbox 会先 click 再 change，只处理一次，避免重复 PATCH）
-  if(el.dataset.act === 'toggle' && e.type === 'click') return;
+  const el = e.target.closest('[data-act]');
+  if(!el || bulkBusy) return;
+  if((el.dataset.act==='toggle' || el.dataset.act==='menu') && e.type==='click') return;
   const box = el.closest('[data-uid]');
   if(!box) return;
-  const uid = box.dataset.uid || '';
-  if(!uid) return;
-  const paused = box.dataset.paused === '1';
-  switch(el.dataset.act){
-    case 'toggle':   toggleAcct(uid, !!el.checked); break;
-    case 'refresh':  refreshAcct(uid); break;
-    case 'balance':  balanceAcct(uid); break;
-    case 'revive':   reviveAcct(uid); break;
-    case 'pause':    pauseAcct(uid, !paused); break;
-    case 'profile':  editProfile(uid); break;
-    case 'test':     testAcct(uid); break;
-    case 'json':     showJSON(uid); break;
-    case 'delete':   deleteAcct(uid); break;
+  const uid = box.dataset.uid;
+  const action = el.dataset.act==='menu'?el.value:el.dataset.act;
+  if(el.dataset.act==='menu') el.value='';
+  const target = acctState.visible.find(a=>a.uid===uid);
+  switch(action){
+    case 'toggle': toggleAcct(uid,el.checked); break;
+    case 'checkin': case 'refresh': case 'balance': case 'unfreeze': case 'revive': case 'delete': runBulk(action,[{uid,nickname:target?.nickname}]); break;
+    case 'pause': pauseAcct(uid,box.dataset.paused!=='1'); break;
+    case 'profile': editProfile(uid); break;
+    case 'test': testAcct(uid); break;
+    case 'json': showJSON(uid); break;
   }
 }
 (function bindAcctDelegation(){
-  const tbl = document.getElementById('acctTable');
-  if(!tbl) return;
-  tbl.addEventListener('click', acctAct);
-  tbl.addEventListener('change', function(e){
-    if(e.target && e.target.dataset && e.target.dataset.act === 'toggle') acctAct(e);
+  const table = document.getElementById('acctTable');
+  table.addEventListener('click',acctAct);
+  table.addEventListener('change',e=>{
+    if(bulkBusy) return;
+    const el = e.target;
+    if(el.hasAttribute('data-select-page')){
+      for(const a of acctState.visible){
+        if(el.checked) selectedAccounts.set(a.uid,{uid:a.uid,nickname:a.nickname});
+        else selectedAccounts.delete(a.uid);
+      }
+      updateSelection();
+    } else if(el.hasAttribute('data-select')){
+      const a = acctState.visible.find(a=>a.uid===el.dataset.select);
+      if(el.checked) selectedAccounts.set(a.uid,{uid:a.uid,nickname:a.nickname});
+      else selectedAccounts.delete(a.uid);
+      updateSelection();
+    } else { acctAct(e); }
   });
 })();
 
@@ -580,84 +606,99 @@ async function toggleAcct(uid, enabled){
   if(!r.ok){ const e = await r.json().catch(()=>({})); alert('切换失败：'+apiErr(e)); loadAccounts(true); return; }
   loadAccounts(true);
 }
-async function refreshAcct(uid){
-  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/refresh', {
-    method:'POST', headers: authHeader()
-  });
-  if(!r.ok){ const e = await r.json().catch(()=>({})); alert('刷新失败：'+apiErr(e)); }
-  invalidate('/admin/api/accounts');
-  loadAccounts(true);
-}
-async function deleteAcct(uid){
-  if(!confirm('确认删除账号 '+uid+'？将同时删除 auths 文件（不可逆）。')) return;
-  const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid), {
-    method:'DELETE', headers: authHeader()
-  });
-  if(!r.ok){ const e = await r.json().catch(()=>({})); alert('删除失败：'+apiErr(e)); }
-  invalidate('/admin/api/accounts');
-  loadAccounts(true);
-}
 async function showJSON(uid){
   const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/json', {cache:'no-store'});
   const d = await r.json();
-  document.getElementById('modalTitle').textContent = '凭证预览（脱敏）— '+(d.nickname||d.uid);
+  document.getElementById('modalTitle').textContent = '凭证预览 · '+(d.nickname||d.uid);
   document.getElementById('modalBody').textContent = JSON.stringify(d, null, 2);
-  document.getElementById('modalBg').classList.add('show');
+  document.getElementById('modalBg').showModal();
 }
-function closeModal(){ document.getElementById('modalBg').classList.remove('show'); }
+function closeModal(){ document.getElementById('modalBg').close(); }
 
 /* ─── 运维动作 ─── */
-async function post(path, payload){
-  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json', ...authHeader()},
-    body: payload===undefined? undefined : JSON.stringify(payload)});
-  const d = await r.json().catch(()=>({}));
-  if(!r.ok){ alert('操作失败：'+apiErr(d)); return null; }
+async function apiRequest(path, method='POST', payload){
+  const r=await fetch(path,{method,headers:{'Content-Type':'application/json',...authHeader()},body:payload===undefined?undefined:JSON.stringify(payload)});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(apiErr(d));
   return d;
 }
-async function balanceAcct(uid){
-  // 刷额度默认只更新余额（不动冷却）。要解冻需显式确认：解冻会清掉冷却/熔断/
-  // 降权状态，等于绕过调度保护，不能是「顺手点一下」的副作用。
-  const unfreeze = confirm('只刷新余额？（点【取消】则同时解除该账号的冷却/熔断/降权）\n\n账号：'+uid);
-  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/balance'+(unfreeze?'':'?apply=1'));
-  if(d){
-    invalidate('/admin/api/accounts'); invalidate('/admin/api/credits'); loadAccounts(true);
-    if(!unfreeze) alert(d.cooling_cleared ? '余额已刷新，并已解除冷却' : '余额已刷新（无可解除的冷却）');
-  }
+async function post(path,payload){
+  try { return await apiRequest(path,'POST',payload); }
+  catch(e){ alert('操作失败：'+e.message); return null; }
 }
 async function pauseAcct(uid, pause){
   const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+(pause?'/pause':'/resume'));
   if(d){ invalidate('/admin/api/accounts'); loadAccounts(true); }
 }
-async function reviveAcct(uid){
-  if(!confirm('复活账号 '+uid+'？将同时清除冷却/熔断/降权状态。')) return;
-  const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/revive');
-  if(d){ invalidate('/admin/api/accounts'); loadAccounts(true); }
-}
 async function editProfile(uid){
-  const w = prompt('调度权重（1-100，1 = 不干预，数字越大越优先）','1');
+  const w = prompt('调度权重（1–100，数值越大越优先）','1');
   if(w===null) return;
-  const n = prompt('备注（纯展示）','');
+  const n = prompt('备注','');
   if(n===null) return;
   const d = await post('/admin/api/accounts/'+encodeURIComponent(uid)+'/profile', {weight: Number(w)||1, note: n});
   if(d){ invalidate('/admin/api/accounts'); loadAccounts(true); }
 }
-async function bulk(action){
+const bulkLabels = {checkin:'签到',balance:'刷新额度',refresh:'刷新 Token',test:'连通测试',enable:'启用',disable:'停用',pause:'暂停调度',resume:'恢复调度',unfreeze:'刷新额度并解冻',revive:'解除禁用',export:'导出',delete:'删除'};
+async function runBulk(action, targets){
+  if(bulkBusy) return;
+  action = action || document.getElementById('bulkAction').value;
+  targets = targets || Array.from(selectedAccounts.values());
+  if(!targets.length || !bulkLabels[action]) return;
+  if(action==='delete' && !confirm('确定删除这 '+targets.length+' 个账号？凭证文件会一并删除，无法撤销。\n\n'+targets.slice(0,10).map(a=>a.nickname||a.uid).join('\n')+(targets.length>10?'\n…':''))) return;
+  if((action==='unfreeze' || action==='revive') && !confirm('对 '+targets.length+' 个账号执行「'+bulkLabels[action]+'」？将重置冷却、熔断与失败状态。')) return;
+  bulkBusy = true;
+  updateSelection();
   const st = document.getElementById('bulkStatus');
-  st.style.display=''; st.className='login-status'; st.textContent='执行中...';
-  const d = await post('/admin/api/accounts/set_all', {action});
-  if(d){ st.className='login-status ok'; st.textContent='已处理 '+d.changed+' 个账号'; invalidate('/admin/api/accounts'); loadAccounts(true); }
-  else { st.className='login-status err'; st.textContent='失败'; }
-}
-async function checkinAll(){
-  const st = document.getElementById('bulkStatus');
-  st.style.display=''; st.className='login-status'; st.textContent='签到中（并发查询上游）...';
-  const d = await post('/admin/api/checkin_all');
-  if(d){
-    const ok = (d.accounts||[]).filter(a=>!a.error).length;
-    st.className='login-status ok';
-    st.textContent = '完成：成功 '+ok+' / '+(d.accounts||[]).length;
-    invalidate('/admin/api/accounts'); invalidate('/admin/api/credits'); loadAccounts(true);
-  } else { st.className='login-status err'; st.textContent='失败'; }
+  const progress = document.getElementById('bulkProgress');
+  st.style.display=''; st.className='login-status';
+  progress.hidden=false; progress.max=targets.length; progress.value=0;
+  let done=0, success=0;
+  const failed=[];
+  const report=()=>{ progress.value=done; st.textContent=bulkLabels[action]+'中 · '+done+' / '+targets.length; };
+  report();
+  try{
+    if(action==='export'){
+      if(!await exportCreds(targets.map(a=>a.uid))){ st.textContent='已取消导出'; return; }
+      success=targets.length; done=targets.length;
+    } else if(['enable','disable','pause','resume'].includes(action)){
+      const d=await apiRequest('/admin/api/accounts/set_all','POST',{action,uids:targets.map(a=>a.uid)});
+      success=d.changed; done=targets.length;
+      if(success<targets.length) failed.push('部分账号状态已变化，请刷新后重试');
+    } else {
+      let next=0;
+      await Promise.all(Array.from({length:Math.min(4,targets.length)},async()=>{
+        while(next<targets.length){
+          const a=targets[next++];
+          try{
+            const base='/admin/api/accounts/'+encodeURIComponent(a.uid);
+            const d=action==='checkin'
+              ? await apiRequest('/admin/api/checkin_all','POST',{uids:[a.uid]})
+              : await apiRequest(base+(action==='delete'?'':'/'+(action==='unfreeze'?'balance?apply=1':action)),action==='delete'?'DELETE':'POST');
+            if(action==='checkin'){
+              const result=d.accounts?.[0];
+              if(!result || result.error || !result.checked_in) throw new Error(result?.error||'签到未完成');
+            }
+            if(action==='test' && !d.ok) throw new Error(d.error||'连通测试失败');
+            if(action==='delete') selectedAccounts.delete(a.uid);
+            success++;
+          }catch(e){ failed.push((a.nickname||a.uid)+'：'+e.message); }
+          finally { done++; report(); }
+        }
+      }));
+    }
+    progress.value=done;
+    st.className='login-status '+(failed.length?'err':'ok');
+    st.textContent=bulkLabels[action]+'完成：成功 '+success+' / '+targets.length+(failed.length?'\n'+failed.join('\n'):'');
+  }catch(e){ st.className='login-status err'; st.textContent=bulkLabels[action]+'失败：'+e.message; }
+  finally {
+    progress.hidden=true;
+    bulkBusy=false;
+    updateSelection();
+    if(action!=='export'){
+      invalidate('/admin/api/accounts'); invalidate('/admin/api/credits');
+      await loadAccounts(true);
+    }
+  }
 }
 
 /* ─── 用量统计 ─── */
@@ -700,7 +741,7 @@ async function loadAliases(){
   const st = document.getElementById('aliasStatus');
   if(!box) return;
   try{
-    const d = await apiGet('/admin/api/aliases', 'usage', 3000);
+    const d = await apiGet('/admin/api/aliases', 'aliases', 3000);
     box.value = aliasesToText(d.aliases);
     st.style.display='none';
   }catch(e){
@@ -747,13 +788,12 @@ async function loadUsage(force){
   try{
     const d = await apiGet('/admin/api/usage?'+q.toString(), 'usage', 5000, force);
     if(!d.enabled){
-      el.innerHTML = '<div style="color:var(--dim);padding:14px">用量统计未启用（config.usage.enabled=false）。</div>';
+      el.innerHTML = '<div class="empty">用量统计未开启</div>';
       return;
     }
     meta.style.display='';
     meta.className='login-status';
-    meta.textContent = '统计自 ' + new Date(d.snapshot.started_at).toLocaleString()
-      + ' · 积分采样' + (d.credit_sampling_enabled ? '已启用（' + d.snapshot.credit_sampling_interval_sec + 's 节流）' : '已关闭');
+    meta.textContent = '统计自 ' + new Date(d.snapshot.started_at).toLocaleString('zh-CN');
     usageState.total = (d.total==null? (d.snapshot.models||[]).length : d.total);
     usageState.page = d.page || usageState.page;
     usageState.pageSize = d.page_size || usageState.pageSize;
@@ -774,17 +814,17 @@ function renderUsage(snap){
     const card = (label,val,sub)=>'<div class="card" style="padding:14px 16px"><div style="font-size:11px;color:var(--dim);margin-bottom:6px">'+label+'</div>'
       +'<div style="font-size:22px;font-weight:600" class="mono">'+val+'</div>'
       +(sub?'<div style="font-size:11px;color:var(--dim);margin-top:6px">'+sub+'</div>':'')+'</div>';
-    kpi.innerHTML = card('整体平均缓存率', pct(t.cache_rate_pct),
+    kpi.innerHTML = card('缓存命中率', pct(t.cache_rate_pct),
                         fmt(t.cache_read_tokens||0)+' / '+fmt(t.prompt_tokens||0)+' input tokens')
-      + card('整体平均积分 / 百万 token', cpm(t.credits_per_million),
-             t.credit_samples?('采样 '+fmt(t.credit_samples)+' 次 · 累计 '+(t.sampled_credits||0).toFixed(2)+' 积分'):'窗口未满，暂无采样')
-      + card('整体平均吞吐', tps(t.avg_tps)+' tok/s',
-             t.timing_samples?(fmt(t.timed_completion_tokens||0)+' token / '+fmt(Math.round((t.gen_ms_sum||0)/1000))+'s 生成 · 首字 '+ms(t.avg_ttft_ms)+'ms'):'暂无流式样本')
+      + card('积分 / 百万 Token', cpm(t.credits_per_million),
+             t.credit_samples?('采样 '+fmt(t.credit_samples)+' 次 · 累计 '+(t.sampled_credits||0).toFixed(2)+' 积分'):'暂无采样')
+      + card('平均吞吐', tps(t.avg_tps)+' tok/s',
+             t.timing_samples?(fmt(t.timed_completion_tokens||0)+' token / '+fmt(Math.round((t.gen_ms_sum||0)/1000))+'s 生成 · 首字 '+ms(t.avg_ttft_ms)+'ms'):'暂无样本')
       + card('累计请求', fmt(t.requests),
              fmt(usageState.total)+' 个模型 · 总计 '+fmt(t.total_tokens||0)+' tokens');
   }
   if(!rows.length){
-    el.innerHTML = '<div style="color:var(--dim);padding:14px">暂无用量数据（发一次对话后即有）。</div>';
+    el.innerHTML = '<div class="empty">暂无用量数据</div>';
     return;
   }
   const sortBtn = (key, label) => '<th class="sortable" data-sort="'+esc(key)+'" style="cursor:pointer;user-select:none" title="点击排序">'
@@ -868,7 +908,7 @@ async function loadRequests(force){
     const ml = document.getElementById('metricsLine');
     ml.style.display='';
     if(!d.enabled){
-      ml.className='login-status'; ml.textContent='请求流水未启用（config reqlog.enabled）';
+      ml.className='login-status'; ml.textContent='请求记录未开启';
       el.innerHTML=''; return;
     }
     const m = d.metrics||{};
@@ -927,7 +967,7 @@ async function importCred(){
   const st = document.getElementById('impStatus');
   st.style.display=''; st.className='login-status'; st.textContent='导入中...';
   let body, contentType;
-  if(v.startsWith('{')){
+  if(v.startsWith('{') || v.startsWith('[')){
     body = JSON.stringify({json: v}); contentType='application/json';
   } else {
     body = JSON.stringify({callback_url: v}); contentType='application/json';
@@ -939,9 +979,9 @@ async function importCred(){
     const d = await r.json();
     if(!r.ok){ st.className='login-status err'; st.textContent='导入失败：'+apiErr(d)+(d.accounts?importDetail(d):''); return; }
     st.className='login-status ok';
-    st.textContent = d.accounts ? importSummary(d) : ('导入成功：'+(d.uid||'?')+'（'+(d.action||'')+'）');
+    st.textContent = d.accounts ? importSummary(d) : ('导入成功：'+(d.nickname||d.uid||''));
     document.getElementById('impInput').value='';
-    loadAccounts();
+    invalidate('/admin/api/accounts'); loadAccounts(true);
   }catch(e){ st.className='login-status err'; st.textContent='导入失败：'+e.message; }
 }
 
@@ -978,14 +1018,14 @@ async function importFiles(input){
   st.className = fail? 'login-status err':'login-status ok';
   st.textContent = '文件导入完成：成功 '+ok+' 条'+(fail?('，'+fail+' 个文件失败（'+lastErr+'）'):'');
   input.value='';
-  loadAccounts();
+  invalidate('/admin/api/accounts'); loadAccounts(true);
 }
 
 async function testAcct(uid){
   const model = prompt('用哪个模型测试连通性？（留空用默认模型）','');
   if(model===null) return;
   const st = document.getElementById('bulkStatus');
-  st.style.display=''; st.className='login-status'; st.textContent='测试中...';
+  st.style.display=''; st.className='login-status'; st.textContent='测试中…';
   const q = model.trim() ? '?model='+encodeURIComponent(model.trim()) : '';
   const r = await fetch('/admin/api/accounts/'+encodeURIComponent(uid)+'/test'+q, {
     method:'POST', headers: authHeader()
@@ -994,26 +1034,24 @@ async function testAcct(uid){
   if(!r.ok){ st.className='login-status err'; st.textContent='测试失败：'+apiErr(d); return; }
   if(d.ok){
     st.className='login-status ok';
-    st.textContent='连通正常：'+d.model+' · '+d.latency_ms+'ms';
+    st.textContent='连通正常 · '+d.model+' · '+d.latency_ms+'ms';
   } else {
     st.className='login-status err';
     st.textContent='不可用：'+(d.error||'')+(d.kind?'［'+d.kind+'］':'');
   }
 }
-async function exportCreds(){
-  const key = getKey();
-  if(!key){ alert('导出需要先填 API Key'); return; }
+async function exportCreds(uids){
   // 默认脱敏导出（只给前缀 + 长度）；明文导出是可导入的完整凭证，属于高危操作，
   // 必须二次确认，且服务端会写审计日志。
-  const wantRaw = confirm('是否导出**明文**凭证？\n\n【取消】= 脱敏导出（安全，不能用于迁移）\n【确定】= 明文导出（可直接导入，等同交出号池）');
+  const wantRaw = confirm('导出完整凭证？\n\n确定：完整凭证，可重新导入，请妥善保管。\n取消：脱敏副本，仅供查看。');
   let detail = '';
   if(wantRaw){
-    detail = prompt('明文导出确认：请输入 RAW 三个字母以继续', '');
-    if((detail||'').trim().toUpperCase() !== 'RAW'){ alert('已取消明文导出'); return; }
+    detail = prompt('导出完整凭证：输入 RAW 确认', '');
+    if((detail||'').trim().toUpperCase() !== 'RAW') return false;
   }
   const url0 = '/admin/api/accounts/export' + (wantRaw ? '?raw=1' : '');
-  const r = await fetch(url0, {headers: authHeader(), cache:'no-store'});
-  if(!r.ok){ const e = await r.json().catch(()=>({})); alert('导出失败：'+apiErr(e)); return; }
+  const r = await fetch(url0, {method:'POST',headers:{'Content-Type':'application/json',...authHeader()},body:JSON.stringify({uids}),cache:'no-store'});
+  if(!r.ok){ const e = await r.json().catch(()=>({})); throw new Error(apiErr(e)); }
   const blob = await r.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -1021,6 +1059,7 @@ async function exportCreds(){
   a.download = 'trae2api-web-accounts-' + (wantRaw?'raw-':'masked-') + new Date().toISOString().slice(0,10)+'.json';
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(()=>URL.revokeObjectURL(url), 5000);
+  return true;
 }
 
 /* ─── Web 登录闭环 ─── */
@@ -1128,8 +1167,7 @@ async function loadCredits(force){
     renderPager('pgCredits', creditState.page, creditState.pageSize, creditState.total, 'gotoCredits');
     if(meta){
       meta.className='login-status';
-      meta.textContent = '数据时间 '+d.fetched_at + (d.cached? '（缓存，60 秒内不重复查询上游）':'（实时）')
-        + ' · 共 '+fmt(creditState.total)+' 个账号';
+      meta.textContent = '更新于 '+d.fetched_at+' · '+fmt(creditState.total)+' 个账号'+(d.cached?' · 缓存':'');
     }
   }catch(e){
     if(e.name === 'AbortError') return;

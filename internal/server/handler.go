@@ -171,6 +171,7 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/balance", h.withAdminAuth(h.adminAccountBalance))
 	h.mux.HandleFunc("POST /admin/api/accounts/set_all", h.withAdminAuth(h.adminAccountsSetAll))
 	h.mux.HandleFunc("GET /admin/api/accounts/export", h.withAdminAuth(h.adminExportAccounts))
+	h.mux.HandleFunc("POST /admin/api/accounts/export", h.withAdminAuth(h.adminExportAccounts))
 	h.mux.HandleFunc("POST /admin/api/accounts/{uid}/test", h.withAdminAuth(h.adminAccountTest))
 	h.mux.HandleFunc("POST /admin/api/checkin_all", h.withAdminAuth(h.adminCheckinAll))
 	h.mux.HandleFunc("GET /admin/api/requests", h.adminReadAuth(h.adminRequests))

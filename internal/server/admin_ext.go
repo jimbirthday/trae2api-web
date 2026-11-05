@@ -17,6 +17,7 @@ import (
 
 	"trae2api-web/internal/auth"
 	"trae2api-web/internal/logfmt"
+	"trae2api-web/internal/pool"
 	"trae2api-web/internal/reqlog"
 	"trae2api-web/internal/upstream"
 )
@@ -116,22 +117,53 @@ type setAllRequest struct {
 	UIDs   []string `json:"uids,omitempty"`
 }
 
+// accountTargets 先完整校验选择范围，空数组不能退化为操作全部账号。
+func (h *Handler) accountTargets(uids []string) ([]pool.Status, error) {
+	if uids == nil {
+		return h.cfg.Pool.List(), nil
+	}
+	if len(uids) == 0 {
+		return nil, fmt.Errorf("请选择账号")
+	}
+	targets := make([]pool.Status, 0, len(uids))
+	seen := make(map[string]bool, len(uids))
+	for _, uid := range uids {
+		if err := auth.ValidateUID(uid); err != nil {
+			return nil, err
+		}
+		st, ok := h.cfg.Pool.Status(uid)
+		if !ok {
+			return nil, fmt.Errorf("account not found: %s", uid)
+		}
+		if !seen[uid] {
+			targets = append(targets, st)
+			seen[uid] = true
+		}
+	}
+	return targets, nil
+}
+
 // adminAccountsSetAll POST /admin/api/accounts/set_all：批量状态变更。
 func (h *Handler) adminAccountsSetAll(w http.ResponseWriter, r *http.Request) {
 	var req setAllRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		return
 	}
-	targets := req.UIDs
-	if len(targets) == 0 {
-		for _, st := range h.cfg.Pool.List() {
-			targets = append(targets, st.UID)
-		}
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	if action != "enable" && action != "disable" && action != "pause" && action != "resume" {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "action must be enable|disable|pause|resume")
+		return
+	}
+	targets, err := h.accountTargets(req.UIDs)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
 	}
 	changed := 0
-	for _, uid := range targets {
+	for _, target := range targets {
+		uid := target.UID
 		var ok bool
-		switch strings.ToLower(strings.TrimSpace(req.Action)) {
+		switch action {
 		case "enable":
 			ok = h.cfg.Pool.SetEnabled(uid, true, "")
 		case "disable":
@@ -140,9 +172,6 @@ func (h *Handler) adminAccountsSetAll(w http.ResponseWriter, r *http.Request) {
 			ok = h.cfg.Pool.Pause(uid)
 		case "resume":
 			ok = h.cfg.Pool.Resume(uid)
-		default:
-			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "action must be enable|disable|pause|resume")
-			return
 		}
 		if ok {
 			changed++
@@ -157,6 +186,18 @@ func (h *Handler) adminAccountsSetAll(w http.ResponseWriter, r *http.Request) {
 // 与之相对，GET 的额度查询绝不能改调度状态（见 UpdateCreditsFromQuery）。
 // 并发上限固定 6：一次签到 = 2 个上游请求，号池上百个时无上限会打爆上游。
 func (h *Handler) adminCheckinAll(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		UIDs []string `json:"uids"`
+	}
+	if err := decodeBodyOptional(r, &req); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	st, err := h.accountTargets(req.UIDs)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	const concurrency = 6
 	type result struct {
 		UID      string `json:"uid"`
@@ -165,7 +206,6 @@ func (h *Handler) adminCheckinAll(w http.ResponseWriter, r *http.Request) {
 		Credits  int64  `json:"credits"`
 		Error    string `json:"error,omitempty"`
 	}
-	st := h.cfg.Pool.List()
 	out := make([]result, len(st))
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
@@ -223,11 +263,19 @@ func (h *Handler) adminCheckinAll(w http.ResponseWriter, r *http.Request) {
 				// 显式签到后余额回血 → 允许解冻（这是用户主动触发的运维动作）。
 				h.cfg.Pool.ReenableIfCredits(uid, remain)
 				res.Credits = remain
+			} else {
+				if res.Error != "" {
+					res.Error += "; "
+				}
+				res.Error += "balance: " + sanitizeErrMsg(eerr.Error())
 			}
 			out[i] = res
 		}(i, s.UID, s.Nickname)
 	}
 	wg.Wait()
+	h.credits.mu.Lock()
+	h.credits.at = time.Time{}
+	h.credits.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
 }
 
@@ -757,6 +805,27 @@ func (h *Handler) writeAccountStatus(w http.ResponseWriter, uid string) {
 // 导出默认**脱敏**：只有显式 ?raw=1 才返回可用凭证明文，且会写审计日志。
 // 这样「手滑点导出 + 贴到公开渠道」不会一次性泄漏整个号池。
 func (h *Handler) adminExportAccounts(w http.ResponseWriter, r *http.Request) {
+	var uids []string
+	if r.Method == http.MethodPost {
+		var req struct {
+			UIDs []string `json:"uids"`
+		}
+		if err := decodeBody(w, r, &req); err != nil {
+			return
+		}
+		if len(req.UIDs) == 0 {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "请选择账号")
+			return
+		}
+		uids = req.UIDs
+	} else {
+		uids = r.URL.Query()["uid"]
+	}
+	targets, err := h.accountTargets(uids)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
 	raw := r.URL.Query().Get("raw") == "1"
 	mask := func(s string) string {
 		if raw {
@@ -765,7 +834,7 @@ func (h *Handler) adminExportAccounts(w http.ResponseWriter, r *http.Request) {
 		return auth.MaskToken(s, 12)
 	}
 	accounts := make([]map[string]any, 0)
-	for _, st := range h.cfg.Pool.List() {
+	for _, st := range targets {
 		a := h.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
 			continue

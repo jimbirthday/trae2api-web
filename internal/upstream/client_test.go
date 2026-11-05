@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -154,6 +155,59 @@ func TestRefreshTokenUsesAuthApiHost(t *testing.T) {
 	}
 }
 
+func TestRefreshTokenIDEFallback(t *testing.T) {
+	const mismatch = `{"ResponseMetadata":{"Error":{"Code":"10101","Data":{"__Message.error":"refresh token is not matched to the client"},"Message":"invalid parameter"}}}`
+	for _, tc := range []struct {
+		name       string
+		clientID   string
+		status     int
+		body       string
+		fallbackOK bool
+		wantCalls  int
+	}{
+		{"IDE token", ClientID, 400, mismatch, true, 2},
+		{"IDE failure preserves tokens", ClientID, 400, mismatch, false, 2},
+		{"other bad parameter", ClientID, 400, `{"message":"bad parameter"}`, false, 1},
+		{"expired session", ClientID, 401, `{"message":"login required"}`, false, 1},
+		{"custom client", "custom", 400, mismatch, false, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				calls++
+				var body struct{ ClientID, RefreshToken string }
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatal(err)
+				}
+				wantClient := tc.clientID
+				if calls == 2 {
+					wantClient = IDEClientID
+				}
+				if body.ClientID != wantClient || body.RefreshToken != "oldrt" || r.URL.Path != EpExchange {
+					t.Fatalf("unexpected exchange request: %+v %s", body, r.URL.Path)
+				}
+				if calls == 2 && tc.fallbackOK {
+					return jsonResp(200, `{"Result":{"Token":"newat","RefreshToken":"newrt","TokenExpireAt":1795067133456}}`), nil
+				}
+				return jsonResp(tc.status, tc.body), nil
+			})
+			c.ClientID = tc.clientID
+			a := &auth.Auth{AccessToken: "oldat", RefreshToken: "oldrt", ExpiresAt: 1}
+			err := c.RefreshToken(a)
+			if (err == nil) != tc.fallbackOK || calls != tc.wantCalls {
+				t.Fatalf("err=%v calls=%d", err, calls)
+			}
+			if tc.fallbackOK {
+				if a.JWT() != "newat" || a.RefreshTokenValue() != "newrt" || a.ExpiresAt != 1795067133 {
+					t.Fatal("successful exchange did not update tokens and expiry")
+				}
+			} else if a.JWT() != "oldat" || a.RefreshTokenValue() != "oldrt" || a.ExpiresAt != 1 {
+				t.Fatal("failed exchange changed existing credentials")
+			}
+		})
+	}
+}
+
 func TestChatStreamSendsHeadersAndRewritesBody(t *testing.T) {
 	var gotAuth, gotUID, gotAppID, gotIdeVer string
 	var gotBody []byte
@@ -266,5 +320,70 @@ func TestCheckinStatusAndClaim(t *testing.T) {
 	}
 	if path != EpCheckinStatus {
 		t.Errorf("path=%s", path)
+	}
+}
+
+func TestCheckinClaimValidatesResponse(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		ok   bool
+	}{
+		{`{"code":0,"message":"success"}`, true},
+		{`{"code":9004,"message":"invalid order parameters"}`, false},
+		{`{"code":9074,"message":"当前参与用户太多，请稍后再试"}`, false},
+		{`{}`, false},
+		{`null`, false},
+		{`<html>login required</html>`, false},
+		{`{"code":0`, false},
+	} {
+		t.Run(tc.body, func(t *testing.T) {
+			c := testClient(func(r *http.Request) (*http.Response, error) {
+				if r.URL.Path != EpCheckinClaim || r.Header.Get("X-Device-Id") == "" {
+					t.Fatal("missing claim path or device ID")
+				}
+				return jsonResp(200, tc.body), nil
+			})
+			err := c.CheckinClaim(&auth.Auth{UID: "u1", AccessToken: "at"})
+			if (err == nil) != tc.ok {
+				t.Fatalf("claim error=%v, want success=%v", err, tc.ok)
+			}
+			if strings.Contains(tc.body, "9074") && (err == nil || !strings.Contains(err.Error(), "9074")) {
+				t.Fatal("business error code was lost")
+			}
+		})
+	}
+}
+
+func TestUgBusinessErrors(t *testing.T) {
+	c := testClient(func(*http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":1001,"message":"login required"}`), nil
+	})
+	a := &auth.Auth{UID: "u1", AccessToken: "at"}
+	if _, _, _, err := c.CheckinStatus(a); err == nil {
+		t.Fatal("status ignored business error")
+	}
+	if _, _, _, _, err := c.EntUsage(a); err == nil {
+		t.Fatal("balance query ignored business error")
+	}
+}
+
+func TestUgDeviceIDStableWhenMissing(t *testing.T) {
+	deviceID := func(a *auth.Auth) string {
+		req, _ := http.NewRequest(http.MethodPost, "https://ug.example", nil)
+		UgHeaders(req, a)
+		return req.Header.Get("X-Device-Id")
+	}
+	a := &auth.Auth{UID: "u1", AccessToken: "at"}
+	id := deviceID(a)
+	a.AccessToken = "rotated"
+	if len(id) != 32 || deviceID(a) != id || deviceID(&auth.Auth{UID: "u1"}) != id {
+		t.Fatal("missing device ID must stay stable across token refresh and reload")
+	}
+	if deviceID(&auth.Auth{UID: "u2"}) == id {
+		t.Fatal("different accounts share a fallback device ID")
+	}
+	a.DeviceID = "original-device"
+	if deviceID(a) != a.DeviceID {
+		t.Fatal("existing device ID was replaced")
 	}
 }

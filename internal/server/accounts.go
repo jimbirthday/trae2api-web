@@ -66,8 +66,15 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 	wantStatus := strings.ToLower(strings.TrimSpace(q.Get("status")))
 
 	statuses := h.cfg.Pool.List()
+	summary := map[string]int64{"total": int64(len(statuses))}
 	out := make([]accountSummary, 0, len(statuses))
 	for _, s := range statuses {
+		summary["credits"] += s.Credits
+		if s.Enabled && !s.Disabled && !s.Paused && !s.Cooling {
+			summary["available"]++
+		} else {
+			summary["attention"]++
+		}
 		sum := accountSummary{
 			UID:          s.UID,
 			Nickname:     s.Nickname,
@@ -127,6 +134,7 @@ func (h *Handler) adminAccounts(w http.ResponseWriter, r *http.Request) {
 		end = total
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"summary":   summary,
 		"accounts":  filtered[start:end],
 		"total":     total,
 		"page":      page,
@@ -345,6 +353,10 @@ func (h *Handler) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_uid", err.Error())
 		return
 	}
+	if _, ok := h.cfg.Pool.Status(uid); !ok {
+		writeOpenAIError(w, http.StatusNotFound, "not_found", "account not in pool")
+		return
+	}
 	// 优先删该账号真实的落盘文件（可能来自导入目录而非 AuthDir 下的 trae-{uid}.json）。
 	var fp string
 	if a := h.cfg.Pool.AuthByUID(uid); a != nil {
@@ -355,10 +367,13 @@ func (h *Handler) adminDeleteAccount(w http.ResponseWriter, r *http.Request) {
 			fp = p
 		}
 	}
-	removed := h.cfg.Pool.Remove(uid)
 	if fp != "" {
-		_ = os.Remove(fp) // 池条目已删，文件尽量删（不存在不报错）
+		if err := os.Remove(fp); err != nil && !os.IsNotExist(err) {
+			writeOpenAIError(w, http.StatusInternalServerError, "delete_failed", err.Error())
+			return
+		}
 	}
+	removed := h.cfg.Pool.Remove(uid)
 	if !removed {
 		writeOpenAIError(w, http.StatusNotFound, "not_found", "account not in pool")
 		return
