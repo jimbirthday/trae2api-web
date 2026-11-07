@@ -58,12 +58,11 @@ services:
       # 账号凭证与运行态（state/usage/流水）持久化到宿主
       - ./auths:/app/auths
       - ./data:/app/data
+      - ./logs:/app/logs
       # 想用宿主 config.json 覆盖默认配置时，取消下一行注释
       # - ./config.json:/app/config.json:ro
     # 容器 stdout 日志轮转。docker 的 json-file 驱动只能按「大小+份数」限制，
-    # 不支持按天，所以这里用「20MB × 3 份」近似三天量级：本服务 stdout 只有
-    # 启动信息与少量错误，正常一天远达不到 20MB。
-    # （请求流水归档另由 reqlog.retain_days 按天清理，默认 3 天。）
+    # 不支持按天；20MiB × 3 份，加运行日志 64MiB、请求归档 768MiB，合计约 892MiB。
     logging:
       driver: json-file
       options:

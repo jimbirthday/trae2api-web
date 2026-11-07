@@ -177,9 +177,9 @@ func TestArchiveQueueFullNeverBlocks(t *testing.T) {
 
 func TestArchiveRotation(t *testing.T) {
 	dir := t.TempDir()
-	r := New(Config{Dir: dir, Enabled: true, FileMaxBytes: 1}) // 每条都触发轮转
+	r := New(Config{Dir: dir, Enabled: true, FileMaxBytes: 512})
 	for i := 0; i < 5; i++ {
-		r.Record(Event{Outcome: "success", Path: "/v1/x", RequestID: NewRequestID()})
+		r.Record(Event{Outcome: "success", Path: "/v1/x", Model: strings.Repeat("m", 200), RequestID: NewRequestID()})
 	}
 	r.Close()
 	files, _ := filepath.Glob(filepath.Join(dir, "requests-*-*.jsonl"))

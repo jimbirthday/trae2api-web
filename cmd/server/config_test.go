@@ -119,6 +119,7 @@ func TestEnvNewKeysSupported(t *testing.T) {
 	t.Setenv("TW2A_DEGRADE_WINDOW", "20m")
 	t.Setenv("TW2A_SESSION_GC_INTERVAL", "7m")
 	t.Setenv("TW2A_REQLOG_FILE_MAX_MB", "8")
+	t.Setenv("TW2A_REQLOG_TOTAL_MAX_MB", "128")
 	t.Setenv("TW2A_SCHEDULE_REFRESH_HOURS", "2,14")
 	t.Setenv("TW2A_SCHEDULE_BALANCE_HOURS", "9, 21")
 	t.Setenv("TW2A_PUBLIC_BASE_URL", "https://trae.example.com/")
@@ -138,6 +139,9 @@ func TestEnvNewKeysSupported(t *testing.T) {
 	}
 	if c.ReqLog.FileMaxMB != 8 {
 		t.Errorf("file_max_mb=%d", c.ReqLog.FileMaxMB)
+	}
+	if c.ReqLog.TotalMaxMB != 128 {
+		t.Errorf("total_max_mb=%d", c.ReqLog.TotalMaxMB)
 	}
 	if got := c.Schedule.RefreshHours; len(got) != 2 || got[0] != 2 || got[1] != 14 {
 		t.Errorf("refresh_hours=%v", got)
@@ -199,6 +203,27 @@ func TestNormalizeRejectsZeroDuration(t *testing.T) {
 	os.WriteFile(fp, []byte(`{"session":{"ttl":"0s"}}`), 0o600)
 	if _, err := Load(fp); err == nil {
 		t.Fatal("want error for zero duration")
+	}
+}
+
+func TestRequestLogBudgetCannotBeExceeded(t *testing.T) {
+	for _, tc := range []struct {
+		total, file, wantTotal, wantFile int
+	}{
+		{2048, 4096, 768, 768},
+		{0, 16, 768, 16},
+		{-1, -1, 768, 16},
+		{1, 16, 1, 1},
+		{64, 8, 64, 8},
+	} {
+		c := Default()
+		c.ReqLog.TotalMaxMB, c.ReqLog.FileMaxMB = tc.total, tc.file
+		if err := c.normalize(); err != nil {
+			t.Fatal(err)
+		}
+		if c.ReqLog.TotalMaxMB != tc.wantTotal || c.ReqLog.FileMaxMB != tc.wantFile {
+			t.Fatalf("input=%+v actual total=%d file=%d", tc, c.ReqLog.TotalMaxMB, c.ReqLog.FileMaxMB)
+		}
 	}
 }
 

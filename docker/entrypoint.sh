@@ -6,13 +6,16 @@
 # 这里只在「确实写不进去」时才 chown，避免无谓改写宿主属主。
 set -e
 
-mkdir -p /app/auths /app/data /app/data/logs
+mkdir -p /app/auths /app/data /app/data/logs /app/logs
 
 if ! su-exec app:app test -w /app/auths 2>/dev/null; then
   chown -R app:app /app/auths || true
 fi
 if ! su-exec app:app test -w /app/data 2>/dev/null; then
   chown -R app:app /app/data || true
+fi
+if ! su-exec app:app test -w /app/logs 2>/dev/null; then
+  chown -R app:app /app/logs || true
 fi
 
 # config 文件不存在时用镜像内置默认（只读挂载/空挂载都能跑起来）

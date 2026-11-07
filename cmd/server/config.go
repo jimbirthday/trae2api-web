@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"trae2api-web/internal/reqlog"
 	"trae2api-web/internal/upstream"
 )
 
@@ -58,10 +59,11 @@ type Config struct {
 	} `json:"session"`
 
 	ReqLog struct {
-		Enabled    bool   `json:"enabled"`     // 请求流水归档（默认 true）
-		Dir        string `json:"dir"`         // "./data/logs"
-		FileMaxMB  int    `json:"file_max_mb"` // 单文件上限（默认 16）
-		RetainDays int    `json:"retain_days"` // 保留天数（默认 3）
+		Enabled    bool   `json:"enabled"`      // 请求流水归档（默认 true）
+		Dir        string `json:"dir"`          // "./data/logs"
+		FileMaxMB  int    `json:"file_max_mb"`  // 单文件上限（默认 16）
+		TotalMaxMB int    `json:"total_max_mb"` // 总量上限（默认及最大 768）
+		RetainDays int    `json:"retain_days"`  // 保留天数（默认 3）
 	} `json:"reqlog"`
 
 	Stream struct {
@@ -168,6 +170,7 @@ func Default() *Config {
 	c.ReqLog.Enabled = true
 	c.ReqLog.Dir = "./data/logs"
 	c.ReqLog.FileMaxMB = 16
+	c.ReqLog.TotalMaxMB = int(reqlog.MaxTotalBytes >> 20)
 	c.ReqLog.RetainDays = 3
 
 	c.Stream.Thinking = StreamThinkingReasoning
@@ -331,6 +334,7 @@ func applyEnv(c *Config) {
 	envBool("TW2A_REQLOG_ENABLED", &c.ReqLog.Enabled)
 	envStr("TW2A_REQLOG_DIR", &c.ReqLog.Dir)
 	envInt("TW2A_REQLOG_FILE_MAX_MB", &c.ReqLog.FileMaxMB)
+	envInt("TW2A_REQLOG_TOTAL_MAX_MB", &c.ReqLog.TotalMaxMB)
 	envInt("TW2A_REQLOG_RETAIN_DAYS", &c.ReqLog.RetainDays)
 
 	// 定时任务
@@ -563,9 +567,14 @@ func (c *Config) normalize() error {
 		c.warnf("reqlog.file_max_mb=%d 非法，已回落 16", c.ReqLog.FileMaxMB)
 		c.ReqLog.FileMaxMB = 16
 	}
-	if c.ReqLog.FileMaxMB > 4096 {
-		c.warnf("reqlog.file_max_mb=%d 超过上限 4096，已夹紧", c.ReqLog.FileMaxMB)
-		c.ReqLog.FileMaxMB = 4096
+	maxTotalMB := int(reqlog.MaxTotalBytes >> 20)
+	if c.ReqLog.TotalMaxMB <= 0 || c.ReqLog.TotalMaxMB > maxTotalMB {
+		c.warnf("reqlog.total_max_mb=%d 超出范围 1..%d，已回落上限", c.ReqLog.TotalMaxMB, maxTotalMB)
+		c.ReqLog.TotalMaxMB = maxTotalMB
+	}
+	if c.ReqLog.FileMaxMB > c.ReqLog.TotalMaxMB {
+		c.warnf("reqlog.file_max_mb=%d 超过总量上限 %d，已夹紧", c.ReqLog.FileMaxMB, c.ReqLog.TotalMaxMB)
+		c.ReqLog.FileMaxMB = c.ReqLog.TotalMaxMB
 	}
 	if c.ReqLog.RetainDays <= 0 {
 		c.warnf("reqlog.retain_days=%d 非法，已回落 3", c.ReqLog.RetainDays)

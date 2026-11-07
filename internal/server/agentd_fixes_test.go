@@ -237,6 +237,9 @@ func TestSaveConfigRejectsInvalidPatch(t *testing.T) {
 		`{"schedule":{"checkin_hour":99}}`,
 		`{"schedule":{"refresh_hours":[]}}`,
 		`{"cooldown":"not-an-object"}`,
+		`{"reqlog":{"total_max_mb":769}}`,
+		`{"reqlog":{"total_max_mb":0}}`,
+		`{"reqlog":{"file_max_mb":1024}}`,
 		`{"unknown_section":{"a":1}}`,
 	}
 	for _, body := range bad {

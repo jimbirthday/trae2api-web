@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"trae2api-web/internal/auth"
+	"trae2api-web/internal/logrotate"
 	"trae2api-web/internal/pool"
 	"trae2api-web/internal/reqlog"
 	"trae2api-web/internal/scheduler"
@@ -28,6 +30,17 @@ import (
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
+
+	runtimeLog, err := logrotate.New("logs/server.log", logrotate.FileMaxBytes, logrotate.MaxFiles)
+	if err != nil {
+		log.Fatalf("open runtime log: %v", err)
+	}
+	defer runtimeLog.Close()
+	log.SetOutput(runtimeLog)
+	// 重定向到普通文件时只写轮转文件，避免外部重定向产生第二份无上限日志。
+	if st, err := os.Stderr.Stat(); err == nil && !st.Mode().IsRegular() {
+		log.SetOutput(io.MultiWriter(os.Stderr, runtimeLog))
+	}
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
@@ -93,10 +106,11 @@ func main() {
 
 	// 请求流水（内存 + 可选 JSONL 归档）。
 	rl := reqlog.New(reqlog.Config{
-		Dir:          cfg.ReqLog.Dir,
-		Enabled:      cfg.ReqLog.Enabled,
-		FileMaxBytes: int64(cfg.ReqLog.FileMaxMB) << 20,
-		RetainDays:   cfg.ReqLog.RetainDays,
+		Dir:           cfg.ReqLog.Dir,
+		Enabled:       cfg.ReqLog.Enabled,
+		FileMaxBytes:  int64(cfg.ReqLog.FileMaxMB) << 20,
+		TotalMaxBytes: int64(cfg.ReqLog.TotalMaxMB) << 20,
+		RetainDays:    cfg.ReqLog.RetainDays,
 	})
 
 	sch := scheduler.New(scheduler.Config{

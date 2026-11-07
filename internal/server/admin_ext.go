@@ -660,7 +660,10 @@ func validateConfigPatch(patch map[string]any) error {
 			if err := checkBoolField(obj, k, "enabled"); err != nil {
 				return err
 			}
-			if err := checkIntField(obj, k, "file_max_mb", 1, 1024); err != nil {
+			if err := checkIntField(obj, k, "file_max_mb", 1, int(reqlog.MaxTotalBytes>>20)); err != nil {
+				return err
+			}
+			if err := checkIntField(obj, k, "total_max_mb", 1, int(reqlog.MaxTotalBytes>>20)); err != nil {
 				return err
 			}
 			if err := checkIntField(obj, k, "retain_days", 1, 365); err != nil {

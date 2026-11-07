@@ -31,6 +31,8 @@ const (
 	recentCap = 512
 	// defaultFileMax 单归档文件默认上限 16MiB。
 	defaultFileMax int64 = 16 << 20
+	// MaxTotalBytes 给运行日志和 Docker 日志留出预算，总日志量保持在 1GB 内。
+	MaxTotalBytes int64 = 768 << 20
 	// defaultQueue 归档写队列默认深度。
 	defaultQueue = 1024
 	// defaultRetainDays 归档默认保留天数。
@@ -77,11 +79,12 @@ func canonicalOutcome(v string) string {
 
 // Config 归档配置。Enabled=false 时只保留内存缓冲与指标。
 type Config struct {
-	Dir          string
-	Enabled      bool
-	FileMaxBytes int64
-	RetainDays   int
-	QueueSize    int
+	Dir           string
+	Enabled       bool
+	FileMaxBytes  int64
+	TotalMaxBytes int64
+	RetainDays    int
+	QueueSize     int
 }
 
 // Event 是一条脱敏请求记录。
@@ -210,6 +213,12 @@ func New(cfg Config) *Recorder {
 	if cfg.Enabled && strings.TrimSpace(cfg.Dir) != "" {
 		if cfg.FileMaxBytes <= 0 {
 			cfg.FileMaxBytes = defaultFileMax
+		}
+		if cfg.TotalMaxBytes <= 0 || cfg.TotalMaxBytes > MaxTotalBytes {
+			cfg.TotalMaxBytes = MaxTotalBytes
+		}
+		if cfg.FileMaxBytes > cfg.TotalMaxBytes {
+			cfg.FileMaxBytes = cfg.TotalMaxBytes
 		}
 		if cfg.RetainDays <= 0 {
 			cfg.RetainDays = defaultRetainDays
@@ -721,23 +730,33 @@ func (a *archive) write(e Event) {
 		a.setErr(err)
 		return
 	}
+	if int64(len(line))+1 > a.cfg.FileMaxBytes {
+		a.noteDropped()
+		a.setErr(fmt.Errorf("request log record exceeds file limit (%d bytes)", a.cfg.FileMaxBytes))
+		return
+	}
 	day := e.Time.Format("20060102")
 	if a.fh == nil || day != a.curDay || (a.cfg.FileMaxBytes > 0 && a.curSize+int64(len(line))+1 > a.cfg.FileMaxBytes) {
-		if err := a.rotate(day); err != nil {
+		if err := a.rotate(day, int64(len(line))+1); err != nil {
+			a.noteDropped()
 			a.setErr(err)
 			return
 		}
 	}
 	if _, err := a.bw.Write(append(line, '\n')); err != nil {
 		a.setErr(err)
+		_ = a.fh.Close()
 		a.fh = nil
+		a.bw = nil
 		return
 	}
 	a.curSize += int64(len(line)) + 1
 }
 
-func (a *archive) rotate(day string) error {
-	a.flush()
+func (a *archive) rotate(day string, recordBytes int64) error {
+	if err := a.flush(); err != nil {
+		return err
+	}
 	if a.fh != nil {
 		_ = a.fh.Close()
 		a.fh = nil
@@ -745,6 +764,16 @@ func (a *archive) rotate(day string) error {
 	if day != a.curDay {
 		a.curDay = day
 		a.curSeq = 0
+		files, err := a.listFiles()
+		if err != nil {
+			return err
+		}
+		// 容量淘汰会留下序号空洞，重启后必须接续当天最新文件。
+		for _, f := range files {
+			if f.day == day && f.seq > a.curSeq {
+				a.curSeq = f.seq
+			}
+		}
 	} else {
 		a.curSeq++
 	}
@@ -766,20 +795,31 @@ func (a *archive) rotate(day string) error {
 		a.bw = bufio.NewWriterSize(fh, 32*1024)
 		a.curPath = p
 		a.curSize = st.Size()
-		if st.Size() > 0 && a.cfg.FileMaxBytes > 0 && st.Size() >= a.cfg.FileMaxBytes {
+		if st.Size()+recordBytes > a.cfg.FileMaxBytes {
 			fh.Close()
 			a.fh = nil
 			a.curSeq++
 			continue
 		}
+		// 一次预留整个文件的剩余空间，写每条记录时无需扫描目录。
+		if err := a.makeRoom(a.cfg.FileMaxBytes - a.curSize); err != nil {
+			fh.Close()
+			a.fh = nil
+			a.bw = nil
+			return err
+		}
 		return nil
 	}
 }
 
-func (a *archive) flush() {
+func (a *archive) flush() error {
 	if a.bw != nil {
-		_ = a.bw.Flush()
+		if err := a.bw.Flush(); err != nil {
+			a.setErr(err)
+			return err
+		}
 	}
+	return nil
 }
 
 func (a *archive) setErr(err error) {
@@ -822,8 +862,49 @@ func (a *archive) cleanup() {
 		}
 		if err := os.Remove(path); err == nil {
 			a.forgetLines(path)
+		} else if !os.IsNotExist(err) {
+			a.setErr(err)
 		}
 	}
+	if err := a.makeRoom(0); err != nil {
+		a.setErr(err)
+	}
+}
+
+// makeRoom 按日期、序号淘汰最旧归档；清理失败时停止写入，不能突破容量上限。
+func (a *archive) makeRoom(reserve int64) error {
+	limit := a.cfg.TotalMaxBytes
+	if limit <= 0 || limit > MaxTotalBytes {
+		limit = MaxTotalBytes
+	}
+	files, err := a.listFiles()
+	if err != nil {
+		return err
+	}
+	total := reserve
+	for _, f := range files {
+		total += f.size
+		if f.path == a.curPath && a.curSize > f.size {
+			total += a.curSize - f.size
+		}
+	}
+	for _, f := range files {
+		if total <= limit {
+			return nil
+		}
+		if f.path == a.curPath {
+			continue
+		}
+		if err := os.Remove(f.path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		a.forgetLines(f.path)
+		total -= f.size
+	}
+	if total > limit {
+		return fmt.Errorf("request log limit reached (%d bytes)", limit)
+	}
+	return nil
 }
 
 // forgetLines 清掉已删除文件的行数缓存，避免 map 随天数无限增长。

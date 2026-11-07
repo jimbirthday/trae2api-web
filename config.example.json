@@ -42,6 +42,7 @@
     "enabled": true,
     "dir": "./data/logs",
     "file_max_mb": 16,
+    "total_max_mb": 768,
     "retain_days": 3
   },
   "schedule": {
